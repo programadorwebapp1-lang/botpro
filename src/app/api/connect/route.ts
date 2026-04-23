@@ -1,13 +1,10 @@
 import { NextResponse } from "next/server";
 import { startBaileysSession } from "@/lib/baileys";
-import { requireApiToken } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
-export async function POST(request: Request) {
+export async function POST() {
   try {
-    const authResponse = requireApiToken(request);
-    if (authResponse) return authResponse;
     await startBaileysSession();
     return NextResponse.json({ ok: true });
   } catch (error) {
