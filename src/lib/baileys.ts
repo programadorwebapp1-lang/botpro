@@ -21,6 +21,8 @@ type SessionState = {
   lastQrAt: number | null;
   reconnecting: boolean;
   lastError: string | null;
+  syncFailureCount: number;
+  resetPending: boolean;
 };
 
 const sessionId = DEFAULT_INSTANCE_ID;
@@ -38,6 +40,8 @@ function ensureSession(id: string) {
       lastQrAt: null,
       reconnecting: false,
       lastError: null,
+      syncFailureCount: 0,
+      resetPending: false,
     });
   }
   return sessions.get(id)!;
@@ -50,6 +54,15 @@ function scheduleReconnect(state: SessionState, delayMs: number) {
     state.reconnecting = false;
     void startBaileysSession();
   }, delayMs);
+}
+
+function clearSessionAuth() {
+  const authPath = path.join(authRoot, sessionId);
+  fs.rmSync(authPath, { recursive: true, force: true });
+}
+
+function isAppStateSyncCorruption(message: string) {
+  return message.includes("tried remove, but no previous op") || message.includes("failed to sync state from version");
 }
 
 export async function startBaileysSession() {
@@ -112,9 +125,29 @@ export async function startBaileysSession() {
           state.lastError =
             disconnectError?.message ??
             (typeof statusCode === "number" ? `statusCode:${statusCode}` : "desconhecido");
+          if (state.lastError && isAppStateSyncCorruption(state.lastError)) {
+            state.syncFailureCount += 1;
+          } else {
+            state.syncFailureCount = 0;
+          }
           emitRealtime("whatsapp:status", { instance_id: sessionId, status: state.status, error: state.lastError });
 
           const shouldReconnect = typeof statusCode === "number" ? statusCode !== DisconnectReason.loggedOut : true;
+          const shouldResetAuth = state.syncFailureCount >= 2 && isAppStateSyncCorruption(state.lastError ?? "");
+          if (shouldResetAuth && !state.resetPending) {
+            state.resetPending = true;
+            clearSessionAuth();
+            state.socket = null;
+            state.qr = null;
+            state.lastError = "Estado do WhatsApp corrompido; sessão resetada. Reconecte novamente.";
+            emitRealtime("whatsapp:status", { instance_id: sessionId, status: state.status, error: state.lastError });
+            setTimeout(() => {
+              state.resetPending = false;
+              state.syncFailureCount = 0;
+            }, 2000);
+            return;
+          }
+
           if (shouldReconnect) {
             scheduleReconnect(state, statusCode === DisconnectReason.restartRequired ? 1000 : 4000);
           }
