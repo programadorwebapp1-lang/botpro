@@ -2,7 +2,6 @@ import "dotenv/config";
 import http from "http";
 import next from "next";
 import { Server } from "socket.io";
-import { parse } from "url";
 import { setRealtimeServer } from "./src/lib/realtime";
 
 async function main() {
@@ -13,8 +12,8 @@ async function main() {
   await app.prepare();
 
   const server = http.createServer((req, res) => {
-    const parsedUrl = parse(req.url ?? "", true);
-    void handle(req, res, parsedUrl);
+    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    void handle(req, res, { pathname: url.pathname, query: Object.fromEntries(url.searchParams) } as never);
   });
 
   const io = new Server(server, {
