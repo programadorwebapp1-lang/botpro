@@ -15,6 +15,7 @@ import { DEFAULT_INSTANCE_ID } from "./app-config";
 
 type SessionState = {
   socket: ReturnType<typeof makeWASocket> | null;
+  connectPromise: Promise<SessionState> | null;
   status: "connected" | "disconnected" | "connecting";
   qr: string | null;
   lastQrAt: number | null;
@@ -31,6 +32,7 @@ function ensureSession(id: string) {
   if (!sessions.has(id)) {
     sessions.set(id, {
       socket: null,
+      connectPromise: null,
       status: "disconnected",
       qr: null,
       lastQrAt: null,
@@ -41,73 +43,96 @@ function ensureSession(id: string) {
   return sessions.get(id)!;
 }
 
+function scheduleReconnect(state: SessionState, delayMs: number) {
+  if (state.reconnecting) return;
+  state.reconnecting = true;
+  setTimeout(() => {
+    state.reconnecting = false;
+    void startBaileysSession();
+  }, delayMs);
+}
+
 export async function startBaileysSession() {
   await connectMongo();
   const state = ensureSession(sessionId);
   if (state.socket) return state;
+  if (state.connectPromise) return state.connectPromise;
 
-  fs.mkdirSync(authRoot, { recursive: true });
-  const authPath = path.join(authRoot, sessionId);
-  const { state: authState, saveCreds } = await loadMultiFileAuthState(authPath);
-  const { version } = await fetchLatestBaileysVersion();
+  state.connectPromise = (async () => {
+    try {
+      fs.mkdirSync(authRoot, { recursive: true });
+      const authPath = path.join(authRoot, sessionId);
+      const { state: authState, saveCreds } = await loadMultiFileAuthState(authPath);
+      const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
-    version,
-    auth: {
-      creds: authState.creds,
-      keys: makeCacheableSignalKeyStore(authState.keys),
-    },
-    printQRInTerminal: false,
-    generateHighQualityLinkPreview: true,
-    markOnlineOnConnect: true,
-    syncFullHistory: false,
-  });
-
-  state.socket = sock;
-  state.status = "connecting";
-
-  sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", async (update) => {
-    if (update.qr) {
-      state.qr = await QRCode.toDataURL(update.qr);
-      state.lastQrAt = Date.now();
-      state.status = "disconnected";
-      emitRealtime("whatsapp:qr", { instance_id: sessionId, qr: state.qr, status: state.status });
-    }
-
-    if (update.connection === "open") {
-      state.status = "connected";
-      state.qr = null;
-      emitRealtime("whatsapp:status", {
-        instance_id: sessionId,
-        status: state.status,
-        numero: normalizePhoneNumber(sock.user?.id?.split(":")[0] ?? ""),
+      const sock = makeWASocket({
+        version,
+        auth: {
+          creds: authState.creds,
+          keys: makeCacheableSignalKeyStore(authState.keys),
+        },
+        printQRInTerminal: false,
+        generateHighQualityLinkPreview: true,
+        markOnlineOnConnect: true,
+        syncFullHistory: false,
       });
-    }
 
-    if (update.connection === "close") {
-      state.status = "disconnected";
+      state.socket = sock;
+      state.status = "connecting";
+      state.lastError = null;
+
+      sock.ev.on("creds.update", saveCreds);
+      sock.ev.on("connection.update", async (update) => {
+        if (update.qr) {
+          state.qr = await QRCode.toDataURL(update.qr);
+          state.lastQrAt = Date.now();
+          state.status = "disconnected";
+          emitRealtime("whatsapp:qr", { instance_id: sessionId, qr: state.qr, status: state.status });
+        }
+
+        if (update.connection === "open") {
+          state.status = "connected";
+          state.qr = null;
+          state.lastError = null;
+          emitRealtime("whatsapp:status", {
+            instance_id: sessionId,
+            status: state.status,
+            numero: normalizePhoneNumber(sock.user?.id?.split(":")[0] ?? ""),
+          });
+        }
+
+        if (update.connection === "close") {
+          state.status = "disconnected";
+          state.socket = null;
+
+          const disconnectError = update.lastDisconnect?.error as
+            | { message?: string; output?: { statusCode?: number } }
+            | undefined;
+          const statusCode = disconnectError?.output?.statusCode;
+          state.lastError =
+            disconnectError?.message ??
+            (typeof statusCode === "number" ? `statusCode:${statusCode}` : "desconhecido");
+          emitRealtime("whatsapp:status", { instance_id: sessionId, status: state.status, error: state.lastError });
+
+          const shouldReconnect = typeof statusCode === "number" ? statusCode !== DisconnectReason.loggedOut : true;
+          if (shouldReconnect) {
+            scheduleReconnect(state, statusCode === DisconnectReason.restartRequired ? 1000 : 4000);
+          }
+        }
+      });
+
+      return state;
+    } catch (error) {
       state.socket = null;
-      const disconnectError = update.lastDisconnect?.error as { message?: string; output?: { statusCode?: number } } | undefined;
-      state.lastError =
-        disconnectError?.message ??
-        (disconnectError?.output?.statusCode ? `statusCode:${disconnectError.output.statusCode}` : "desconhecido");
-      emitRealtime("whatsapp:status", { instance_id: sessionId, status: state.status, error: state.lastError });
-      const shouldReconnect =
-        typeof disconnectError?.output?.statusCode === "number"
-          ? disconnectError.output.statusCode !== DisconnectReason.loggedOut
-          : true;
-      if (shouldReconnect && !state.reconnecting) {
-        state.reconnecting = true;
-        setTimeout(() => {
-          state.reconnecting = false;
-          void startBaileysSession();
-        }, 4000);
-      }
+      state.status = "disconnected";
+      state.lastError = error instanceof Error ? error.message : "Falha ao iniciar conexão";
+      throw error;
+    } finally {
+      state.connectPromise = null;
     }
-  });
+  })();
 
-  return state;
+  return state.connectPromise;
 }
 
 export async function getSessionStatus() {
