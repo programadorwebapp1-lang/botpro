@@ -107,6 +107,11 @@ function isUsableAuthCreds(
   );
 }
 
+function isAuthShapeError(error: unknown) {
+  const message = error instanceof Error ? `${error.message} ${error.stack ?? ""}` : String(error);
+  return message.includes("reading 'public'") || (message.includes("public") && message.includes("baileys"));
+}
+
 function encodeAuthId(id: string) {
   return encodeURIComponent(id);
 }
@@ -317,8 +322,11 @@ async function connectFreshSocket(sessionId: string) {
       next_retry_at: null,
     });
 
+    let resetAuth: (() => Promise<void>) | null = null;
+
     try {
-      const { state: authState, saveCreds, resetAuth } = await loadAuthState(sessionId);
+      const { state: authState, saveCreds, resetAuth: resetAuthFn } = await loadAuthState(sessionId);
+      resetAuth = resetAuthFn;
       if (state.stopRequested) {
         return state;
       }
@@ -447,7 +455,7 @@ async function connectFreshSocket(sessionId: string) {
             }
 
             try {
-              await resetAuth();
+              await resetAuth?.();
             } catch (resetError) {
               state.lastError = resetError instanceof Error ? resetError.message : "Falha ao resetar auth";
             }
@@ -503,6 +511,9 @@ async function connectFreshSocket(sessionId: string) {
       sock.ev.on("creds.update", onCredsUpdate);
       sock.ev.on("connection.update", onConnectionUpdate);
     } catch (error) {
+      if (!state.stopRequested && resetAuth && isAuthShapeError(error)) {
+        await resetAuth().catch(() => undefined);
+      }
       if (state.stopRequested) {
         state.status = "disconnected";
         state.socket = null;
