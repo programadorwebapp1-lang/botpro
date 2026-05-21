@@ -94,6 +94,19 @@ function reviveValue<T>(value: unknown) {
   return JSON.parse(JSON.stringify(value), BufferJSON.reviver) as T;
 }
 
+function isUsableAuthCreds(
+  creds: Partial<AuthenticationState["creds"]> | null | undefined
+): creds is AuthenticationState["creds"] {
+  return Boolean(
+    creds &&
+      creds.noiseKey?.public &&
+      creds.signedIdentityKey?.public &&
+      creds.signedPreKey?.keyPair?.public &&
+      creds.registrationId != null &&
+      creds.advSecretKey
+  );
+}
+
 function encodeAuthId(id: string) {
   return encodeURIComponent(id);
 }
@@ -199,8 +212,8 @@ async function loadAuthState(sessionId: string): Promise<{
     { new: true, upsert: true }
   ).lean().exec();
 
-  const storedCreds = session?.creds ? (reviveValue(session.creds) as AuthenticationState["creds"]) : initAuthCreds();
-  let creds = storedCreds;
+  const storedCreds = session?.creds ? (reviveValue(session.creds) as Partial<AuthenticationState["creds"]>) : null;
+  let creds = isUsableAuthCreds(storedCreds) ? storedCreds : initAuthCreds();
 
   const saveCreds = async () => {
     await updateSessionDoc(sessionId, {
