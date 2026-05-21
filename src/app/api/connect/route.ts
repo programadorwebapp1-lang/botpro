@@ -1,13 +1,7 @@
-import { NextResponse } from "next/server";
-import { startBaileysSession } from "@/lib/baileys";
+import { handleConnectRequest } from "@/lib/api-handlers";
 
 export const runtime = "nodejs";
 
-export async function POST() {
-  try {
-    await startBaileysSession();
-    return NextResponse.json({ ok: true });
-  } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Erro" }, { status: 500 });
-  }
+export async function POST(request: Request) {
+  return handleConnectRequest(request);
 }

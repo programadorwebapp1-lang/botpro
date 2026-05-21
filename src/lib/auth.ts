@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 export function getExpectedToken() {
-  return process.env.API_TOKEN ?? process.env.WHATSAPP_API_TOKEN ?? "";
+  return process.env.API_TOKEN ?? process.env.WHATSAPP_API_TOKEN ?? process.env.ERP_API_TOKEN ?? "";
 }
 
 export function requireApiToken(request: Request) {
@@ -18,4 +18,12 @@ export function requireApiToken(request: Request) {
   }
 
   return null;
+}
+
+export function requireSocketToken(token: string | undefined | null) {
+  const expected = getExpectedToken();
+  if (!expected) {
+    return true;
+  }
+  return token === expected;
 }

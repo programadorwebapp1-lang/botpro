@@ -6,30 +6,69 @@ import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import Image from "next/image";
 import { io, Socket } from "socket.io-client";
 
-type StatusPayload = { status: string; qr: string | null; numero: string | null; lastError?: string | null };
-type LogRow = { _id: string; numero: string; mensagem: string; status: string; created_at: string };
+type StatusPayload = {
+  status: string;
+  qr: string | null;
+  numero: string | null;
+  lastError?: string | null;
+  lastConnectedAt?: string | null;
+  lastQrAt?: string | null;
+  reconnectAttempts?: number;
+  nextRetryAt?: string | null;
+};
 
-export function DashboardClient() {
+type LogRow = {
+  _id: string;
+  kind: "message" | "system" | "error";
+  numero?: string;
+  mensagem?: string;
+  status: string;
+  detail?: string;
+  created_at: string;
+};
+
+type DashboardClientProps = {
+  authToken: string;
+};
+
+export function DashboardClient({ authToken }: DashboardClientProps) {
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [numero, setNumero] = useState("");
   const [mensagem, setMensagem] = useState("");
   const [loading, setLoading] = useState(false);
-  const [snack, setSnack] = useState<{ open: boolean; message: string; severity: "success" | "error" }>({ open: false, message: "", severity: "success" });
+  const [snack, setSnack] = useState<{ open: boolean; message: string; severity: "success" | "error" }>({
+    open: false,
+    message: "",
+    severity: "success",
+  });
 
-  const columns = useMemo<GridColDef[]>(() => [
-    { field: "numero", headerName: "Número", flex: 1 },
-    { field: "mensagem", headerName: "Mensagem", flex: 2 },
-    { field: "status", headerName: "Status", width: 120 },
-    { field: "created_at", headerName: "Data", width: 220 },
-  ], []);
+  const columns = useMemo<GridColDef[]>(
+    () => [
+      { field: "kind", headerName: "Tipo", width: 100 },
+      { field: "numero", headerName: "Número", flex: 1 },
+      { field: "mensagem", headerName: "Mensagem", flex: 2 },
+      { field: "status", headerName: "Status", width: 140 },
+      { field: "detail", headerName: "Detalhe", flex: 2 },
+      { field: "created_at", headerName: "Data", width: 220 },
+    ],
+    []
+  );
+
+  const authHeaders = useCallback((): Record<string, string> => {
+    if (!authToken) {
+      return {};
+    }
+    return { Authorization: `Bearer ${authToken}` };
+  }, [authToken]);
 
   const refresh = useCallback(async () => {
     const [statusRes, logsRes] = await Promise.all([
-      fetch("/api/status").then((r) => r.json()),
-      fetch("/api/logs").then((r) => r.json()),
+      fetch("/status", { headers: authHeaders() }).then((r) => r.json()),
+      fetch("/api/logs", { headers: authHeaders() }).then((r) => r.json()),
     ]);
+
     setStatus(statusRes);
     if (statusRes?.status === "connected") {
       setQrCode(null);
@@ -37,7 +76,7 @@ export function DashboardClient() {
       setQrCode(statusRes.qr);
     }
     setLogs(logsRes.logs ?? []);
-  }, []);
+  }, [authHeaders]);
 
   useEffect(() => {
     const boot = window.setTimeout(() => {
@@ -51,7 +90,11 @@ export function DashboardClient() {
   }, [refresh]);
 
   useEffect(() => {
-    const socket: Socket = io({ path: "/socket.io" });
+    const socket: Socket = io({
+      path: "/socket.io",
+      auth: authToken ? { token: authToken } : undefined,
+    });
+
     socket.on("whatsapp:qr", (payload: StatusPayload) => {
       setStatus(payload);
       if (payload.qr) setQrCode(payload.qr);
@@ -60,18 +103,28 @@ export function DashboardClient() {
       setStatus((current) => ({ ...(current ?? payload), ...payload }));
       if (payload.status === "connected") setQrCode(null);
     });
+    socket.on("whatsapp:message-sent", (payload: { session_id: string; numero: string; status: string; message_id: string | null }) => {
+      setSnack({ open: true, message: `Mensagem ${payload.status}`, severity: "success" });
+    });
     socket.on("log:new", (payload: { log: LogRow }) => {
       setLogs((current) => [payload.log, ...current]);
     });
+    socket.on("connect_error", (error) => {
+      setSnack({ open: true, message: error.message || "Falha no Socket.IO", severity: "error" });
+    });
+
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [authToken]);
 
   async function connect() {
     setLoading(true);
     try {
-      const res = await fetch("/api/connect", { method: "POST" });
+      const res = await fetch("/api/connect", {
+        method: "POST",
+        headers: authHeaders(),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Erro ao conectar");
       setSnack({ open: true, message: "Conexão iniciada", severity: "success" });
@@ -86,7 +139,14 @@ export function DashboardClient() {
   async function send() {
     setLoading(true);
     try {
-      const res = await fetch("/api/send-message", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero, mensagem }) });
+      const res = await fetch("/send-message", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ numero, mensagem }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Erro ao enviar");
       setSnack({ open: true, message: "Mensagem enviada", severity: "success" });
@@ -107,7 +167,7 @@ export function DashboardClient() {
           <Stack direction={{ xs: "column", md: "row" }} spacing={3} sx={{ justifyContent: "space-between", alignItems: { md: "center" } }}>
             <Box>
               <Typography variant="h5" sx={{ fontWeight: 700 }}>Status do WhatsApp</Typography>
-              <Typography color="text.secondary">Integração única para ERP via Socket.IO e polling</Typography>
+              <Typography color="text.secondary">Integração interna com ERP via sessão persistente e Socket.IO seguro</Typography>
               <Typography className="mt-2" color={status?.status === "connected" ? "success.main" : "error.main"} sx={{ fontWeight: 700 }}>
                 {status?.status === "connected" ? "🟢 Conectado" : "🔴 Desconectado"}
               </Typography>
@@ -116,10 +176,16 @@ export function DashboardClient() {
                   Último erro: {status.lastError}
                 </Typography>
               )}
+              {status?.nextRetryAt && status.status !== "connected" && (
+                <Typography className="mt-2" color="info.main" variant="body2">
+                  Próxima tentativa: {status.nextRetryAt}
+                </Typography>
+              )}
             </Box>
             <Stack direction="row" spacing={2}>
-              <Button variant="contained" onClick={connect} disabled={loading}>{loading ? <CircularProgress size={20} /> : "Conectar"}</Button>
-              <Button variant="outlined" onClick={connect} disabled={loading}>Reconectar</Button>
+              <Button variant="contained" onClick={connect} disabled={loading}>
+                {loading ? <CircularProgress size={20} /> : "Reconectar"}
+              </Button>
             </Stack>
           </Stack>
           {qrCode && status?.status !== "connected" && (

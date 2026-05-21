@@ -1,0 +1,24 @@
+import { Schema, model, models } from "mongoose";
+
+const WhatsAppSessionSchema = new Schema(
+  {
+    session_id: { type: String, required: true, unique: true, index: true },
+    creds: { type: Schema.Types.Mixed, required: true, default: {} },
+    keys: { type: Schema.Types.Mixed, required: true, default: {} },
+    status: { type: String, required: true, default: "idle" },
+    qr: { type: String, required: false, default: null },
+    last_error: { type: String, required: false, default: null },
+    last_connected_at: { type: Date, required: false, default: null },
+    last_qr_at: { type: Date, required: false, default: null },
+    reconnect_attempts: { type: Number, required: true, default: 0 },
+    next_retry_at: { type: Date, required: false, default: null },
+  },
+  {
+    timestamps: true,
+    collection: "whatsapp_sessions",
+  }
+);
+
+WhatsAppSessionSchema.index({ status: 1, updatedAt: -1 });
+
+export default models.WhatsAppSession || model("WhatsAppSession", WhatsAppSessionSchema);

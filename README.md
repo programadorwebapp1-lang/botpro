@@ -1,13 +1,15 @@
 # WhatsApp ERP Bot
 
-Sistema WhatsApp Web com Baileys, Next.js, MongoDB, MUI, Tailwind e atualização em tempo real.
+Sistema interno de WhatsApp Web com Baileys, Next.js, MongoDB e Socket.IO, pensado para uso privado com ERP Flask.
 
 ## Recursos
 
 - Conexão com WhatsApp via Baileys
+- Sessão persistida no MongoDB
+- Reconexão automática com backoff
 - QR Code no dashboard
 - Envio de mensagens via API
-- Logs em MongoDB
+- Logs em MongoDB com TTL
 - Autenticação por `Authorization: Bearer`
 - Atualização em tempo real com Socket.IO
 
@@ -24,8 +26,12 @@ Crie um arquivo `.env` na raiz com:
 MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/whatsapp_panel
 MONGODB_DB=whatsapp_panel
 PORT=3000
+WHATSAPP_SESSION_ID=primary
 API_TOKEN=replace_with_a_strong_token
-JOBS_TOKEN=replace_with_a_strong_token
+MESSAGE_LOG_TTL_DAYS=30
+WHATSAPP_RECONNECT_BASE_MS=1500
+WHATSAPP_RECONNECT_MAX_MS=60000
+WHATSAPP_SEND_DELAY_MS=900
 ```
 
 Se você tiver legado usando `MONGO_URI`, o projeto também aceita esse nome.
@@ -49,16 +55,10 @@ Todos os endpoints protegidos aceitam:
 Authorization: Bearer SEU_TOKEN
 ```
 
-### Conectar
-
-```http
-POST /api/connect
-```
-
 ### Status
 
 ```http
-GET /api/status
+GET /status
 ```
 
 ### Logs
@@ -70,7 +70,7 @@ GET /api/logs
 ### Enviar mensagem
 
 ```http
-POST /api/send-message
+POST /send-message
 ```
 
 Body:
@@ -80,6 +80,18 @@ Body:
   "numero": "5599999999999",
   "mensagem": "Teste"
 }
+```
+
+### Reconnect manual
+
+```http
+POST /api/connect
+```
+
+### Healthcheck
+
+```http
+GET /health
 ```
 
 ## Deploy no Render
@@ -107,12 +119,10 @@ No ERP Flask, configure:
 ```env
 WHATSAPP_API_URL=https://seu-bot.onrender.com
 WHATSAPP_API_TOKEN=mesmo_token_do_render
-JOBS_TOKEN=mesmo_token_do_render
 ```
 
-Para enviar mensagem, faça `POST` em `/api/send-message` com o header:
+Para enviar mensagem, faça `POST` em `/send-message` com o header:
 
 ```http
 Authorization: Bearer SEU_TOKEN
 ```
-
