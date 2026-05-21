@@ -14,7 +14,7 @@ export function requireApiToken(request: Request) {
   const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
 
   if (token !== expected) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
   return null;

@@ -61,6 +61,15 @@ Authorization: Bearer SEU_TOKEN
 GET /status
 ```
 
+Resposta compatível com o ERP:
+
+```json
+{
+  "connected": true,
+  "phone": "556892281187"
+}
+```
+
 ### Logs
 
 ```http
@@ -77,8 +86,8 @@ Body:
 
 ```json
 {
-  "numero": "5599999999999",
-  "mensagem": "Teste"
+  "number": "556892281187",
+  "message": "Teste local do ERP"
 }
 ```
 
