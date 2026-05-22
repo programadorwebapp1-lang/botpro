@@ -11,7 +11,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { delay } from "@whiskeysockets/baileys";
 import { connectMongo } from "./mongo";
-import { DEFAULT_INSTANCE_ID } from "./app-config";
+import { DEFAULT_TENANT_ID, LEGACY_SESSION_ID } from "./app-config";
 import { normalizePhoneNumber, jidFromPhone } from "./wa-utils";
 import { emitRealtime } from "./realtime";
 import WhatsAppSession from "@/models/WhatsAppSession";
@@ -47,7 +47,7 @@ type ConnectionUpdate = {
   };
 };
 
-const SESSION_ID = DEFAULT_INSTANCE_ID;
+const SESSION_ID = DEFAULT_TENANT_ID;
 const MESSAGE_LOG_TTL_DAYS = Number(process.env.MESSAGE_LOG_TTL_DAYS ?? 30);
 const RECONNECT_BASE_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_BASE_MS ?? 1500);
 const RECONNECT_MAX_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_MAX_MS ?? 60000);
@@ -59,6 +59,7 @@ const MESSAGE_DEDUPE_WINDOW_MS = Number(process.env.WHATSAPP_MESSAGE_DEDUPE_WIND
 const MAX_MESSAGE_LENGTH = Number(process.env.WHATSAPP_MAX_MESSAGE_LENGTH ?? 4096);
 const sessions = new Map<string, RuntimeState>();
 const recentMessages = new Map<string, number>();
+let bootPromise: Promise<void> | null = null;
 
 function createRuntimeState(): RuntimeState {
   return {
@@ -84,6 +85,133 @@ function getState(sessionId = SESSION_ID) {
     sessions.set(sessionId, createRuntimeState());
   }
   return sessions.get(sessionId)!;
+}
+
+function getSessionAlias(sessionId: string) {
+  return sessionId === DEFAULT_TENANT_ID ? LEGACY_SESSION_ID : sessionId;
+}
+
+function buildSessionFilter(sessionId: string) {
+  const alias = getSessionAlias(sessionId);
+  if (alias === sessionId) {
+    return { tenant_id: sessionId };
+  }
+  return {
+    $or: [{ tenant_id: sessionId }, { session_id: alias }],
+  };
+}
+
+function buildLogFilter(sessionId: string) {
+  const alias = getSessionAlias(sessionId);
+  if (alias === sessionId) {
+    return {
+      $or: [{ tenant_id: sessionId }, { session_id: sessionId }],
+    };
+  }
+
+  return {
+    $or: [{ tenant_id: sessionId }, { session_id: alias }],
+  };
+}
+
+async function migrateLegacyDefaultSession() {
+  await connectMongo();
+
+  const [defaultDoc, legacyDoc] = await Promise.all([
+    WhatsAppSession.findOne({ tenant_id: DEFAULT_TENANT_ID }).lean().exec(),
+    WhatsAppSession.findOne({ session_id: LEGACY_SESSION_ID }).lean().exec(),
+  ]);
+
+  if (!legacyDoc && !defaultDoc) {
+    return;
+  }
+
+  if (defaultDoc && !legacyDoc) {
+    return;
+  }
+
+  if (defaultDoc && legacyDoc && String(defaultDoc._id) !== String(legacyDoc._id)) {
+    const preferLegacy = !isUsableAuthCreds(defaultDoc.creds as Partial<AuthenticationState["creds"]>) &&
+      isUsableAuthCreds(legacyDoc.creds as Partial<AuthenticationState["creds"]>);
+    const source = preferLegacy ? legacyDoc : defaultDoc;
+
+    await WhatsAppSession.updateOne(
+      { _id: defaultDoc._id },
+      {
+        $set: {
+          tenant_id: DEFAULT_TENANT_ID,
+          session_id: LEGACY_SESSION_ID,
+          creds: source.creds,
+          keys: source.keys,
+          status: source.status,
+          qr: source.qr ?? null,
+          last_error: source.last_error ?? null,
+          last_connected_at: source.last_connected_at ?? null,
+          last_qr_at: source.last_qr_at ?? null,
+          reconnect_attempts: source.reconnect_attempts ?? 0,
+          next_retry_at: source.next_retry_at ?? null,
+        },
+      }
+    ).exec();
+
+    await WhatsAppSession.deleteOne({ _id: legacyDoc._id }).exec();
+    return;
+  }
+
+  const sourceDoc = defaultDoc ?? legacyDoc;
+  if (!sourceDoc) {
+    return;
+  }
+
+  await WhatsAppSession.updateOne(
+    { _id: sourceDoc._id },
+    {
+      $set: {
+        tenant_id: DEFAULT_TENANT_ID,
+        session_id: LEGACY_SESSION_ID,
+      },
+    }
+  ).exec();
+}
+
+async function ensureSessionDocument(sessionId: string) {
+  await connectMongo();
+
+  if (sessionId === DEFAULT_TENANT_ID) {
+    await migrateLegacyDefaultSession();
+  }
+
+  const existing = await WhatsAppSession.findOne(buildSessionFilter(sessionId)).lean().exec();
+  if (existing) {
+    const desiredSessionId = getSessionAlias(sessionId);
+    if (existing.tenant_id !== sessionId || existing.session_id !== desiredSessionId) {
+      await WhatsAppSession.updateOne(
+        { _id: existing._id },
+        { $set: { tenant_id: sessionId, session_id: desiredSessionId } }
+      ).exec();
+    }
+    return;
+  }
+
+  await WhatsAppSession.updateOne(
+    { tenant_id: sessionId },
+    {
+      $setOnInsert: {
+        tenant_id: sessionId,
+        session_id: getSessionAlias(sessionId),
+        creds: serializeValue(initAuthCreds()),
+        keys: {},
+        status: "idle",
+        qr: null,
+        last_error: null,
+        reconnect_attempts: 0,
+        next_retry_at: null,
+        last_connected_at: null,
+        last_qr_at: null,
+      },
+    },
+    { upsert: true }
+  ).exec();
 }
 
 function serializeValue<T>(value: T) {
@@ -120,8 +248,8 @@ function persistSessionPatch(sessionId: string, patch: Record<string, unknown>) 
   const state = getState(sessionId);
   state.writeChain = state.writeChain.then(async () => {
     await WhatsAppSession.updateOne(
-      { session_id: sessionId },
-      { $set: { ...patch, session_id: sessionId } },
+      buildSessionFilter(sessionId),
+      { $set: { ...patch, tenant_id: sessionId, session_id: getSessionAlias(sessionId) } },
       { upsert: true }
     ).exec();
   }, async () => undefined);
@@ -180,7 +308,8 @@ async function writeMessageLog(sessionId: string, payload: {
   provider_message_id?: string;
 }) {
   const log = await MessageLog.create({
-    session_id: sessionId,
+    tenant_id: sessionId,
+    session_id: getSessionAlias(sessionId),
     expire_at: buildMessageLogExpireAt(),
     ...payload,
   });
@@ -197,12 +326,13 @@ async function loadAuthState(sessionId: string): Promise<{
   saveCreds: () => Promise<void>;
   resetAuth: () => Promise<void>;
 }> {
-  await connectMongo();
+  await ensureSessionDocument(sessionId);
   const session = await WhatsAppSession.findOneAndUpdate(
-    { session_id: sessionId },
+    buildSessionFilter(sessionId),
     {
       $setOnInsert: {
-        session_id: sessionId,
+        tenant_id: sessionId,
+        session_id: getSessionAlias(sessionId),
         creds: serializeValue(initAuthCreds()),
         keys: {},
         status: "idle",
@@ -228,7 +358,7 @@ async function loadAuthState(sessionId: string): Promise<{
 
   const keysStore = {
     get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
-      const current = await WhatsAppSession.findOne({ session_id: sessionId }).lean().exec();
+      const current = await WhatsAppSession.findOne(buildSessionFilter(sessionId)).lean().exec();
       const result = {} as Record<string, SignalDataTypeMap[T]>;
 
       for (const id of ids) {
@@ -264,21 +394,36 @@ async function loadAuthState(sessionId: string): Promise<{
       }
 
       await WhatsAppSession.updateOne(
-        { session_id: sessionId },
+        buildSessionFilter(sessionId),
         {
           ...(Object.keys($set).length ? { $set } : {}),
           ...(Object.keys($unset).length ? { $unset } : {}),
+          $setOnInsert: {
+            tenant_id: sessionId,
+            session_id: getSessionAlias(sessionId),
+            creds: serializeValue(initAuthCreds()),
+            keys: {},
+            status: "idle",
+            qr: null,
+            last_error: null,
+            reconnect_attempts: 0,
+            next_retry_at: null,
+            last_connected_at: null,
+            last_qr_at: null,
+          },
         },
         { upsert: true }
       ).exec();
     },
     clear: async () => {
       await WhatsAppSession.updateOne(
-        { session_id: sessionId },
+        buildSessionFilter(sessionId),
         {
           $set: {
             creds: serializeValue(initAuthCreds()),
             keys: {},
+            tenant_id: sessionId,
+            session_id: getSessionAlias(sessionId),
           },
         },
         { upsert: true }
@@ -309,6 +454,7 @@ async function connectFreshSocket(sessionId: string) {
 
   state.connectPromise = (async () => {
     await connectMongo();
+    await ensureSessionDocument(sessionId);
     if (state.stopRequested) {
       state.status = "disconnected";
       return state;
@@ -372,6 +518,7 @@ async function connectFreshSocket(sessionId: string) {
           });
           emitRealtime("whatsapp:qr", {
             session_id: sessionId,
+            tenant_id: sessionId,
             qr: state.qr,
             status: state.status,
           });
@@ -397,6 +544,7 @@ async function connectFreshSocket(sessionId: string) {
           });
           emitRealtime("whatsapp:status", {
             session_id: sessionId,
+            tenant_id: sessionId,
             status: state.status,
             numero: normalizePhoneNumber(sock.user?.id?.split(":")[0] ?? ""),
           });
@@ -422,6 +570,7 @@ async function connectFreshSocket(sessionId: string) {
 
           emitRealtime("whatsapp:status", {
             session_id: sessionId,
+            tenant_id: sessionId,
             status: state.status,
             error: state.lastError,
           });
@@ -586,12 +735,36 @@ function trackRecentMessage(sessionId: string, numero: string, mensagem: string)
   return true;
 }
 
-export async function startBaileysSession() {
-  return connectFreshSocket(SESSION_ID);
+async function getAutoStartTenantIds() {
+  await ensureSessionDocument(DEFAULT_TENANT_ID);
+  const sessions = await WhatsAppSession.find({}).lean().exec();
+  const tenantIds = new Set<string>([DEFAULT_TENANT_ID]);
+
+  for (const session of sessions) {
+    const tenantId = typeof session.tenant_id === "string" && session.tenant_id.trim() ? session.tenant_id : "";
+    const sessionId = typeof session.session_id === "string" && session.session_id.trim() ? session.session_id : "";
+    const resolvedTenantId = tenantId || (sessionId === LEGACY_SESSION_ID ? DEFAULT_TENANT_ID : sessionId);
+    if (!resolvedTenantId) {
+      continue;
+    }
+
+    const hasUsableCreds = isUsableAuthCreds(
+      session.creds as Partial<AuthenticationState["creds"]> | null | undefined
+    );
+    if (resolvedTenantId === DEFAULT_TENANT_ID || hasUsableCreds || session.status === "connected" || session.status === "connecting") {
+      tenantIds.add(resolvedTenantId);
+    }
+  }
+
+  return Array.from(tenantIds);
 }
 
-export async function stopBaileysSession() {
-  const state = getState(SESSION_ID);
+export async function startBaileysSession(sessionId = SESSION_ID) {
+  return connectFreshSocket(sessionId);
+}
+
+export async function stopBaileysSession(sessionId = SESSION_ID) {
+  const state = getState(sessionId);
   state.stopRequested = true;
   clearReconnectTimer(state);
   if (state.socket) {
@@ -607,11 +780,19 @@ export async function stopBaileysSession() {
   state.status = "disconnected";
 }
 
-export async function getSessionStatus() {
+export async function stopAllBaileysSessions() {
+  for (const sessionId of sessions.keys()) {
+    await stopBaileysSession(sessionId);
+  }
+}
+
+export async function getSessionStatus(sessionId = SESSION_ID) {
   await connectMongo();
-  const state = getState(SESSION_ID);
+  await ensureSessionDocument(sessionId);
+  const state = getState(sessionId);
   return {
-    session_id: SESSION_ID,
+    tenant_id: sessionId,
+    session_id: getSessionAlias(sessionId),
     status: state.status,
     qr: state.qr,
     numero: state.socket?.user?.id ? normalizePhoneNumber(state.socket.user.id.split(":")[0] ?? "") : null,
@@ -623,9 +804,10 @@ export async function getSessionStatus() {
   };
 }
 
-export async function sendWhatsAppMessage(numero: string, mensagem: string) {
+export async function sendWhatsAppMessage(numero: string, mensagem: string, sessionId = SESSION_ID) {
   await connectMongo();
-  const state = getState(SESSION_ID);
+  await ensureSessionDocument(sessionId);
+  const state = getState(sessionId);
   const normalizedNumber = normalizePhoneNumber(numero);
   const messageText = mensagem.trim();
 
@@ -641,17 +823,17 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string) {
     throw new Error(`Mensagem excede o limite de ${MAX_MESSAGE_LENGTH} caracteres`);
   }
 
-  if (!trackRecentMessage(SESSION_ID, normalizedNumber, messageText)) {
+  if (!trackRecentMessage(sessionId, normalizedNumber, messageText)) {
     throw new Error("Mensagem duplicada bloqueada por anti-spam");
   }
 
   return enqueueSend(state, async () => {
-    const sock = await waitForConnectedSocket(SESSION_ID);
+    const sock = await waitForConnectedSocket(sessionId);
     await delay(SEND_DELAY_MS);
     const jid = jidFromPhone(normalizedNumber);
     const result = await sock.sendMessage(jid, { text: messageText });
 
-    const log = await writeMessageLog(SESSION_ID, {
+    const log = await writeMessageLog(sessionId, {
       kind: "message",
       direction: "outbound",
       numero: normalizedNumber,
@@ -661,7 +843,8 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string) {
     });
 
     emitRealtime("whatsapp:message-sent", {
-      session_id: SESSION_ID,
+      session_id: sessionId,
+      tenant_id: sessionId,
       numero: normalizedNumber,
       status: "sent",
       message_id: result?.key?.id ?? null,
@@ -677,15 +860,31 @@ function enqueueSend<T>(state: RuntimeState, task: () => Promise<T>) {
   return nextTask;
 }
 
-export async function getCompanyLogs() {
+export async function getCompanyLogs(sessionId = SESSION_ID) {
   await connectMongo();
-  return MessageLog.find({ session_id: SESSION_ID }).sort({ created_at: -1 }).limit(200).lean().exec();
+  await ensureSessionDocument(sessionId);
+  return MessageLog.find(buildLogFilter(sessionId)).sort({ created_at: -1 }).limit(200).lean().exec();
 }
 
 export async function ensureWhatsAppBoot() {
-  const state = getState(SESSION_ID);
-  if (state.socket || state.connectPromise) {
-    return state;
+  if (bootPromise) {
+    return bootPromise;
   }
-  return startBaileysSession();
+
+  bootPromise = (async () => {
+    await startBaileysSession(DEFAULT_TENANT_ID);
+    const tenantIds = await getAutoStartTenantIds();
+    for (const tenantId of tenantIds) {
+      if (tenantId === DEFAULT_TENANT_ID) {
+        continue;
+      }
+      await startBaileysSession(tenantId);
+    }
+  })();
+
+  try {
+    await bootPromise;
+  } finally {
+    bootPromise = null;
+  }
 }

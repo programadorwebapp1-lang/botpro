@@ -7,6 +7,7 @@ import Image from "next/image";
 import { io, Socket } from "socket.io-client";
 
 type StatusPayload = {
+  tenant_id?: string;
   status: string;
   qr: string | null;
   numero: string | null;
@@ -103,7 +104,7 @@ export function DashboardClient({ authToken }: DashboardClientProps) {
       setStatus((current) => ({ ...(current ?? payload), ...payload }));
       if (payload.status === "connected") setQrCode(null);
     });
-    socket.on("whatsapp:message-sent", (payload: { session_id: string; numero: string; status: string; message_id: string | null }) => {
+    socket.on("whatsapp:message-sent", (payload: { session_id: string; tenant_id?: string; numero: string; status: string; message_id: string | null }) => {
       setSnack({ open: true, message: `Mensagem ${payload.status}`, severity: "success" });
     });
     socket.on("log:new", (payload: { log: LogRow }) => {

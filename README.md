@@ -6,6 +6,7 @@ Sistema interno de WhatsApp Web com Baileys, Next.js, MongoDB e Socket.IO, pensa
 
 - Conexão com WhatsApp via Baileys
 - Sessão persistida no MongoDB
+- Suporte incremental a múltiplos tenants/sessões
 - Reconexão automática com backoff
 - QR Code no dashboard
 - Envio de mensagens via API
@@ -27,6 +28,7 @@ MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/whatsapp_panel
 MONGODB_DB=whatsapp_panel
 PORT=3000
 WHATSAPP_SESSION_ID=primary
+DEFAULT_TENANT_ID=default
 API_TOKEN=replace_with_a_strong_token
 MESSAGE_LOG_TTL_DAYS=30
 WHATSAPP_RECONNECT_BASE_MS=1500
@@ -87,15 +89,20 @@ Body:
 ```json
 {
   "number": "556892281187",
-  "message": "Teste local do ERP"
+  "message": "Teste local do ERP",
+  "tenant_id": "default"
 }
 ```
+
+Se `tenant_id` não for enviado, o sistema usa automaticamente `default` e mantém a sessão atual compatível com o fluxo antigo.
 
 ### Reconnect manual
 
 ```http
 POST /api/connect
 ```
+
+Também aceita `tenant_id` para abrir ou reconectar sessões de outras empresas sem afetar o tenant padrão.
 
 ### Healthcheck
 

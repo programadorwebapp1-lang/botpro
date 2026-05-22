@@ -1,10 +1,12 @@
 import { NextResponse } from "next/server";
 import { getCompanyLogs, getSessionStatus, sendWhatsAppMessage, startBaileysSession } from "./baileys";
 import { requireApiToken } from "./auth";
+import { DEFAULT_TENANT_ID } from "./app-config";
 
 type SendMessagePayload = {
   number: string;
   message: string;
+  tenantId: string;
 };
 
 function jsonError(status: number, error: string) {
@@ -13,6 +15,10 @@ function jsonError(status: number, error: string) {
 
 function normalizeString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function resolveTenantId(value: unknown) {
+  return normalizeString(value) || DEFAULT_TENANT_ID;
 }
 
 function isFormContentType(contentType: string | null) {
@@ -34,7 +40,8 @@ async function parseSendMessagePayload(request: Request): Promise<SendMessagePay
 
     const number = normalizeString(formData.get("number")) || normalizeString(formData.get("numero"));
     const message = normalizeString(formData.get("message")) || normalizeString(formData.get("mensagem"));
-    return { number, message };
+    const tenantId = resolveTenantId(formData.get("tenant_id") ?? formData.get("tenantId"));
+    return { number, message, tenantId };
   }
 
   const rawBody = await request.text();
@@ -56,15 +63,50 @@ async function parseSendMessagePayload(request: Request): Promise<SendMessagePay
   const body = parsed as Record<string, unknown>;
   const number = normalizeString(body.number) || normalizeString(body.numero);
   const message = normalizeString(body.message) || normalizeString(body.mensagem);
-  return { number, message };
+  const tenantId = resolveTenantId(body.tenant_id ?? body.tenantId);
+  return { number, message, tenantId };
 }
 
 function formatStatusResponse(status: Awaited<ReturnType<typeof getSessionStatus>>) {
   return {
     ...status,
+    tenant_id: status.tenant_id,
     connected: status.status === "connected",
     phone: status.numero ?? null,
   };
+}
+
+function resolveRequestTenantId(request: Request) {
+  const url = new URL(request.url);
+  return resolveTenantId(url.searchParams.get("tenant_id") ?? url.searchParams.get("tenantId"));
+}
+
+async function resolveConnectTenantId(request: Request) {
+  const contentType = request.headers.get("content-type");
+
+  if (isFormContentType(contentType)) {
+    const formData = await request.formData().catch(() => null);
+    if (!formData) {
+      return resolveRequestTenantId(request);
+    }
+    return resolveTenantId(formData.get("tenant_id") ?? formData.get("tenantId"));
+  }
+
+  if (contentType?.includes("application/json")) {
+    const rawBody = await request.text();
+    if (!rawBody.trim()) {
+      return resolveRequestTenantId(request);
+    }
+
+    try {
+      const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+      return resolveTenantId(parsed.tenant_id ?? parsed.tenantId);
+    } catch {
+      return resolveRequestTenantId(request);
+    }
+  }
+
+  return resolveRequestTenantId(request);
 }
 
 export async function handleStatusRequest(request: Request) {
@@ -72,7 +114,7 @@ export async function handleStatusRequest(request: Request) {
   if (authResponse) return authResponse;
 
   try {
-    const status = await getSessionStatus();
+    const status = await getSessionStatus(resolveRequestTenantId(request));
     return NextResponse.json(formatStatusResponse(status));
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Falha ao obter status";
@@ -86,7 +128,7 @@ export async function handleLogsRequest(request: Request) {
   if (authResponse) return authResponse;
 
   try {
-    return NextResponse.json({ logs: await getCompanyLogs() });
+    return NextResponse.json({ logs: await getCompanyLogs(resolveRequestTenantId(request)) });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Falha ao obter logs";
     console.error("[logs] failed", detail);
@@ -99,7 +141,7 @@ export async function handleSendMessageRequest(request: Request) {
   if (authResponse) return authResponse;
 
   try {
-    const { number, message } = await parseSendMessagePayload(request);
+    const { number, message, tenantId } = await parseSendMessagePayload(request);
 
     if (!number || !message) {
       console.warn("[send-message] validation failed: missing fields", {
@@ -114,13 +156,14 @@ export async function handleSendMessageRequest(request: Request) {
       messageLength: message.length,
     });
 
-    const result = await sendWhatsAppMessage(number, message);
+    const result = await sendWhatsAppMessage(number, message, tenantId);
 
     return NextResponse.json({
       ok: true,
       status: "sent",
       number,
       message,
+      tenant_id: tenantId,
       message_id: result.message_id,
     });
   } catch (error) {
@@ -140,7 +183,8 @@ export async function handleConnectRequest(request: Request) {
   if (authResponse) return authResponse;
 
   try {
-    await startBaileysSession();
+    const tenantId = await resolveConnectTenantId(request);
+    await startBaileysSession(tenantId);
     return NextResponse.json({ ok: true });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Erro";

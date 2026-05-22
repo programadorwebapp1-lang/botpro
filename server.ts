@@ -2,7 +2,7 @@ import "dotenv/config";
 import http from "http";
 import next from "next";
 import { Server } from "socket.io";
-import { startBaileysSession, stopBaileysSession } from "./src/lib/baileys";
+import { ensureWhatsAppBoot, stopAllBaileysSessions } from "./src/lib/baileys";
 import { requireSocketToken } from "./src/lib/auth";
 import { setRealtimeServer } from "./src/lib/realtime";
 
@@ -32,13 +32,13 @@ async function main() {
   });
 
   setRealtimeServer(io);
-  void startBaileysSession().catch((error) => {
+  void ensureWhatsAppBoot().catch((error) => {
     console.error("[whatsapp] startup error", error);
   });
 
   const shutdown = async () => {
     try {
-      await stopBaileysSession();
+      await stopAllBaileysSessions();
     } catch {
       // ignore shutdown errors
     }
