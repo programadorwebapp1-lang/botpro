@@ -72,6 +72,39 @@ Resposta compatível com o ERP:
 }
 ```
 
+Tambem disponivel em:
+
+- `GET /api/status`
+
+### Sessao
+
+Cria ou inicia uma sessao isolada por `tenant_id` e retorna o status atual, incluindo `qr` quando a conexao ainda nao foi concluida.
+
+```http
+POST /sessions/create
+```
+
+Body:
+
+```json
+{
+  "tenant_id": "11111111111111",
+  "session_id": "11111111111111",
+  "name": "Empresa XYZ"
+}
+```
+
+Consulta o status da sessao:
+
+```http
+GET /sessions/status?tenant_id=11111111111111
+```
+
+Tambem disponivel em:
+
+- `POST /api/sessions/create`
+- `GET /api/sessions/status`
+
 ### Logs
 
 ```http
@@ -96,6 +129,10 @@ Body:
 
 Se `tenant_id` não for enviado, o sistema usa automaticamente `default` e mantém a sessão atual compatível com o fluxo antigo.
 
+Tambem disponivel em:
+
+- `POST /api/send-message`
+
 ### Reconnect manual
 
 ```http
@@ -109,6 +146,10 @@ Também aceita `tenant_id` para abrir ou reconectar sessões de outras empresas 
 ```http
 GET /health
 ```
+
+Tambem disponivel em:
+
+- `GET /api/health`
 
 ## Deploy no Render
 

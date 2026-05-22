@@ -5,6 +5,7 @@ const WhatsAppSessionSchema = new Schema(
   {
     tenant_id: { type: String, required: true, unique: true, index: true, default: DEFAULT_TENANT_ID },
     session_id: { type: String, required: true, unique: true, index: true },
+    name: { type: String, required: false, default: null },
     creds: { type: Schema.Types.Mixed, required: true, default: {} },
     keys: { type: Schema.Types.Mixed, required: true, default: {} },
     status: { type: String, required: true, default: "idle" },

@@ -790,9 +790,11 @@ export async function getSessionStatus(sessionId = SESSION_ID) {
   await connectMongo();
   await ensureSessionDocument(sessionId);
   const state = getState(sessionId);
+  const sessionDoc = await WhatsAppSession.findOne(buildSessionFilter(sessionId)).lean().exec();
   return {
     tenant_id: sessionId,
     session_id: getSessionAlias(sessionId),
+    name: typeof sessionDoc?.name === "string" && sessionDoc.name.trim() ? sessionDoc.name : null,
     status: state.status,
     qr: state.qr,
     numero: state.socket?.user?.id ? normalizePhoneNumber(state.socket.user.id.split(":")[0] ?? "") : null,
@@ -802,6 +804,23 @@ export async function getSessionStatus(sessionId = SESSION_ID) {
     reconnectAttempts: state.reconnectAttempts,
     nextRetryAt: state.nextRetryAt,
   };
+}
+
+export async function updateSessionMetadata(sessionId: string, metadata: { name?: string | null }) {
+  await connectMongo();
+  await ensureSessionDocument(sessionId);
+  const name = typeof metadata.name === "string" && metadata.name.trim() ? metadata.name.trim() : null;
+  await WhatsAppSession.updateOne(
+    buildSessionFilter(sessionId),
+    {
+      $set: {
+        tenant_id: sessionId,
+        session_id: getSessionAlias(sessionId),
+        name,
+      },
+    },
+    { upsert: true }
+  ).exec();
 }
 
 export async function sendWhatsAppMessage(numero: string, mensagem: string, sessionId = SESSION_ID) {
