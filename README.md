@@ -4,9 +4,11 @@ Bot interno de WhatsApp Web com Baileys, Next.js e MongoDB, pensado para uso pri
 
 ## Arquitetura
 
-- 1 sessao WhatsApp unica
-- Persistencia da sessao no MongoDB
-- Reconnect automatico com backoff
+- 1 WhatsApp
+- 1 sessão
+- 1 socket
+- Persistência no MongoDB
+- Reconnect automático com backoff
 - Integração via API Bearer Token
 - Compatibilidade com Render
 
@@ -33,8 +35,6 @@ Crie um arquivo `.env` na raiz com:
 MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/whatsapp_panel
 MONGODB_DB=whatsapp_panel
 PORT=3000
-WHATSAPP_SESSION_ID=primary
-DEFAULT_TENANT_ID=default
 API_TOKEN=replace_with_a_strong_token
 MESSAGE_LOG_TTL_DAYS=30
 WHATSAPP_RECONNECT_BASE_MS=1500

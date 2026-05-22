@@ -11,8 +11,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { delay } from "@whiskeysockets/baileys";
 import { connectMongo } from "./mongo";
-import { DEFAULT_TENANT_ID, LEGACY_SESSION_ID } from "./app-config";
-import { normalizePhoneNumber, jidFromPhone } from "./wa-utils";
+import { jidFromPhone, normalizePhoneNumber } from "./wa-utils";
 import { emitRealtime } from "./realtime";
 import WhatsAppSession from "@/models/WhatsAppSession";
 import MessageLog from "@/models/MessageLog";
@@ -37,9 +36,11 @@ type RuntimeState = {
   reconnectTimer: NodeJS.Timeout | null;
   stopRequested: boolean;
   authResetAttempts: number;
+  authWriteChain: Promise<void>;
   writeChain: Promise<void>;
   socketGeneration: number;
   authCache: AuthCache | null;
+  sessionDocId: string | null;
 };
 
 type ConnectionUpdate = {
@@ -53,8 +54,6 @@ type ConnectionUpdate = {
   };
 };
 
-const SESSION_TENANT_ID = DEFAULT_TENANT_ID;
-const SESSION_ID = LEGACY_SESSION_ID;
 const MESSAGE_LOG_TTL_DAYS = Number(process.env.MESSAGE_LOG_TTL_DAYS ?? 30);
 const RECONNECT_BASE_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_BASE_MS ?? 1500);
 const RECONNECT_MAX_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_MAX_MS ?? 60000);
@@ -83,102 +82,12 @@ function createRuntimeState(): RuntimeState {
     reconnectTimer: null,
     stopRequested: false,
     authResetAttempts: 0,
+    authWriteChain: Promise.resolve(),
     writeChain: Promise.resolve(),
     socketGeneration: 0,
     authCache: null,
+    sessionDocId: null,
   };
-}
-
-function getSessionFilter() {
-  return {
-    $or: [{ tenant_id: SESSION_TENANT_ID }, { session_id: SESSION_ID }],
-  };
-}
-
-function getSessionWriteFilter() {
-  return { tenant_id: SESSION_TENANT_ID };
-}
-
-function getSessionAlias() {
-  return SESSION_ID;
-}
-
-async function normalizeSessionDocument() {
-  await connectMongo();
-
-  const [defaultDoc, legacyDoc] = await Promise.all([
-    WhatsAppSession.findOne({ tenant_id: SESSION_TENANT_ID }).lean().exec(),
-    WhatsAppSession.findOne({ session_id: SESSION_ID }).lean().exec(),
-  ]);
-
-  if (defaultDoc && legacyDoc && String(defaultDoc._id) !== String(legacyDoc._id)) {
-    const preferLegacy =
-      !isUsableAuthCreds(defaultDoc.creds as Partial<AuthenticationState["creds"]> | null | undefined) &&
-      isUsableAuthCreds(legacyDoc.creds as Partial<AuthenticationState["creds"]> | null | undefined);
-    const source = preferLegacy ? legacyDoc : defaultDoc;
-
-    await WhatsAppSession.updateOne(
-      { _id: defaultDoc._id },
-      {
-        $set: {
-          tenant_id: SESSION_TENANT_ID,
-          session_id: SESSION_ID,
-          creds: source.creds,
-          keys: source.keys,
-          status: source.status,
-          qr: source.qr ?? null,
-          last_error: source.last_error ?? null,
-          last_connected_at: source.last_connected_at ?? null,
-          last_qr_at: source.last_qr_at ?? null,
-          reconnect_attempts: source.reconnect_attempts ?? 0,
-          next_retry_at: source.next_retry_at ?? null,
-        },
-      }
-    ).exec();
-    return;
-  }
-
-  if (defaultDoc) {
-    if (defaultDoc.session_id !== SESSION_ID) {
-      await WhatsAppSession.updateOne(
-        { _id: defaultDoc._id },
-        { $set: { tenant_id: SESSION_TENANT_ID, session_id: SESSION_ID } }
-      ).exec();
-    }
-    return;
-  }
-
-  if (legacyDoc) {
-    await WhatsAppSession.updateOne(
-      { _id: legacyDoc._id },
-      { $set: { tenant_id: SESSION_TENANT_ID, session_id: SESSION_ID } }
-    ).exec();
-    return;
-  }
-
-  await WhatsAppSession.updateOne(
-    { tenant_id: SESSION_TENANT_ID },
-    {
-      $setOnInsert: {
-        tenant_id: SESSION_TENANT_ID,
-        session_id: SESSION_ID,
-        creds: serializeValue(initAuthCreds()),
-        keys: {},
-        status: "idle",
-        qr: null,
-        last_error: null,
-        reconnect_attempts: 0,
-        next_retry_at: null,
-        last_connected_at: null,
-        last_qr_at: null,
-      },
-    },
-    { upsert: true }
-  ).exec();
-}
-
-async function ensureSessionDocument() {
-  await normalizeSessionDocument();
 }
 
 function serializeValue<T>(value: T) {
@@ -209,6 +118,37 @@ function isAuthShapeError(error: unknown) {
 
 function encodeAuthId(id: string) {
   return encodeURIComponent(id).replace(/\./g, "%2E").replace(/\$/g, "%24");
+}
+
+function sanitizeKeyValue(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+
+function sanitizeAuthKeys(input: unknown): AuthCache["keys"] {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {};
+  }
+
+  const output: AuthCache["keys"] = {};
+  for (const [category, entries] of Object.entries(input as Record<string, unknown>)) {
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+      continue;
+    }
+
+    const normalizedEntries: Record<string, unknown> = {};
+    for (const [id, value] of Object.entries(entries as Record<string, unknown>)) {
+      const safeValue = sanitizeKeyValue(value);
+      if (safeValue != null) {
+        normalizedEntries[id] = safeValue;
+      }
+    }
+    output[category] = normalizedEntries;
+  }
+
+  return output;
 }
 
 function clearReconnectTimer(runtime: RuntimeState) {
@@ -253,6 +193,50 @@ function pruneRecentMessages() {
   }
 }
 
+function waitForAuthWrites() {
+  return state.authWriteChain.catch(() => undefined);
+}
+
+async function resolveSessionDocId() {
+  if (state.sessionDocId) {
+    return state.sessionDocId;
+  }
+
+  await connectMongo();
+  const docs = await WhatsAppSession.find({}).sort({ updatedAt: -1 }).lean().exec();
+
+  if (docs.length === 0) {
+    const created = await WhatsAppSession.create({
+      creds: serializeValue(initAuthCreds()),
+      keys: {},
+      status: "idle",
+      qr: null,
+      last_error: null,
+      reconnect_attempts: 0,
+      next_retry_at: null,
+      last_connected_at: null,
+      last_qr_at: null,
+    });
+    state.sessionDocId = String(created._id);
+    return state.sessionDocId;
+  }
+
+  const connected = docs.find((doc) => doc.status === "connected" || doc.status === "connecting");
+  const usableCreds = docs.find((doc) => isUsableAuthCreds(doc.creds as Partial<AuthenticationState["creds"]> | null | undefined));
+  const best = connected ?? usableCreds ?? docs[0];
+  state.sessionDocId = String(best._id);
+  return state.sessionDocId;
+}
+
+async function ensureSessionDocument() {
+  await resolveSessionDocId();
+}
+
+async function updateSessionDoc(patch: Record<string, unknown>) {
+  const sessionDocId = await resolveSessionDocId();
+  await WhatsAppSession.updateOne({ _id: sessionDocId }, { $set: patch }).exec();
+}
+
 async function writeMessageLog(payload: {
   kind: "message" | "system" | "error";
   status: string;
@@ -263,28 +247,11 @@ async function writeMessageLog(payload: {
   provider_message_id?: string;
 }) {
   const log = await MessageLog.create({
-    tenant_id: SESSION_TENANT_ID,
-    session_id: SESSION_ID,
     expire_at: buildMessageLogExpireAt(),
     ...payload,
   });
-  emitRealtime("log:new", { session_id: SESSION_ID, log });
+  emitRealtime("log:new", { log });
   return log;
-}
-
-async function persistSessionPatch(patch: Record<string, unknown>) {
-  state.writeChain = state.writeChain.then(async () => {
-    await WhatsAppSession.updateOne(
-      getSessionWriteFilter(),
-      { $set: { ...patch, tenant_id: SESSION_TENANT_ID, session_id: SESSION_ID } },
-      { upsert: true }
-    ).exec();
-  }, async () => undefined);
-  return state.writeChain;
-}
-
-async function updateSessionDoc(patch: Record<string, unknown>) {
-  await persistSessionPatch(patch);
 }
 
 async function loadAuthState(): Promise<{
@@ -293,33 +260,15 @@ async function loadAuthState(): Promise<{
   resetAuth: () => Promise<void>;
 }> {
   await ensureSessionDocument();
-
-  const session = await WhatsAppSession.findOneAndUpdate(
-    getSessionFilter(),
-    {
-      $setOnInsert: {
-        tenant_id: SESSION_TENANT_ID,
-        session_id: SESSION_ID,
-        creds: serializeValue(initAuthCreds()),
-        keys: {},
-        status: "idle",
-        qr: null,
-        last_error: null,
-        reconnect_attempts: 0,
-        next_retry_at: null,
-        last_connected_at: null,
-        last_qr_at: null,
-      },
-    },
-    { upsert: true, returnDocument: "after" }
-  ).lean().exec();
+  const sessionDocId = await resolveSessionDocId();
+  const session = await WhatsAppSession.findById(sessionDocId).lean().exec();
 
   const storedCreds = session?.creds ? (reviveValue(session.creds) as Partial<AuthenticationState["creds"]>) : null;
-  const storedKeys = session?.keys ? (reviveValue(session.keys) as AuthCache["keys"]) : {};
+  const storedKeys = sanitizeAuthKeys(session?.keys ? reviveValue(session.keys) : {});
 
   const cache: AuthCache = {
     creds: isUsableAuthCreds(storedCreds) ? storedCreds : initAuthCreds(),
-    keys: storedKeys && typeof storedKeys === "object" ? storedKeys : {},
+    keys: storedKeys,
   };
   state.authCache = cache;
 
@@ -327,9 +276,15 @@ async function loadAuthState(): Promise<{
     if (!state.authCache) {
       return;
     }
-    await updateSessionDoc({
-      creds: serializeValue(state.authCache.creds),
-    });
+
+    const credsSnapshot = serializeValue(state.authCache.creds);
+    state.authWriteChain = state.authWriteChain.then(
+      async () => {
+        await WhatsAppSession.updateOne({ _id: sessionDocId }, { $set: { creds: credsSnapshot } }).exec();
+      },
+      async () => undefined
+    );
+    await state.authWriteChain;
   };
 
   const keysStore = {
@@ -383,27 +338,22 @@ async function loadAuthState(): Promise<{
         }
       }
 
-      await WhatsAppSession.updateOne(
-        getSessionFilter(),
-        {
-          ...(Object.keys($set).length ? { $set } : {}),
-          ...(Object.keys($unset).length ? { $unset } : {}),
-          $setOnInsert: {
-            tenant_id: SESSION_TENANT_ID,
-            session_id: SESSION_ID,
-            creds: serializeValue(initAuthCreds()),
-            keys: {},
-            status: "idle",
-            qr: null,
-            last_error: null,
-            reconnect_attempts: 0,
-            next_retry_at: null,
-            last_connected_at: null,
-            last_qr_at: null,
-          },
+      state.authWriteChain = state.authWriteChain.then(
+        async () => {
+          const update: Record<string, unknown> = {};
+          if (Object.keys($set).length) {
+            update.$set = $set;
+          }
+          if (Object.keys($unset).length) {
+            update.$unset = $unset;
+          }
+          if (Object.keys(update).length) {
+            await WhatsAppSession.updateOne({ _id: sessionDocId }, update).exec();
+          }
         },
-        { upsert: true }
-      ).exec();
+        async () => undefined
+      );
+      await state.authWriteChain;
     },
     clear: async () => {
       if (!state.authCache) {
@@ -412,20 +362,24 @@ async function loadAuthState(): Promise<{
           keys: {},
         };
       }
+
       state.authCache.creds = initAuthCreds();
       state.authCache.keys = {};
-      await WhatsAppSession.updateOne(
-        getSessionFilter(),
-        {
-          $set: {
-            creds: serializeValue(state.authCache.creds),
-            keys: {},
-            tenant_id: SESSION_TENANT_ID,
-            session_id: SESSION_ID,
-          },
+      state.authWriteChain = state.authWriteChain.then(
+        async () => {
+          await WhatsAppSession.updateOne(
+            { _id: sessionDocId },
+            {
+              $set: {
+                creds: serializeValue(state.authCache!.creds),
+                keys: {},
+              },
+            }
+          ).exec();
         },
-        { upsert: true }
-      ).exec();
+        async () => undefined
+      );
+      await state.authWriteChain;
     },
   } satisfies SignalKeyStore & { clear: () => Promise<void> };
 
@@ -455,12 +409,13 @@ async function connectFreshSocket() {
   }
 
   state.connectPromise = (async () => {
-    await connectMongo();
+    await waitForAuthWrites();
     await ensureSessionDocument();
     if (state.stopRequested) {
       state.status = "disconnected";
       return state;
     }
+
     state.stopRequested = false;
     state.status = "connecting";
     state.lastError = null;
@@ -478,6 +433,7 @@ async function connectFreshSocket() {
       if (state.stopRequested) {
         return state;
       }
+
       const { version } = await fetchLatestBaileysVersion();
       const sock = makeWASocket({
         version,
@@ -522,8 +478,6 @@ async function connectFreshSocket() {
             last_qr_at: state.lastQrAt,
           });
           emitRealtime("whatsapp:qr", {
-            session_id: SESSION_ID,
-            tenant_id: SESSION_TENANT_ID,
             qr: state.qr,
             status: state.status,
           });
@@ -548,8 +502,6 @@ async function connectFreshSocket() {
             next_retry_at: null,
           });
           emitRealtime("whatsapp:status", {
-            session_id: SESSION_ID,
-            tenant_id: SESSION_TENANT_ID,
             status: state.status,
             numero: normalizePhoneNumber(sock.user?.id?.split(":")[0] ?? ""),
           });
@@ -574,8 +526,6 @@ async function connectFreshSocket() {
           });
 
           emitRealtime("whatsapp:status", {
-            session_id: SESSION_ID,
-            tenant_id: SESSION_TENANT_ID,
             status: state.status,
             error: state.lastError,
           });
@@ -625,6 +575,22 @@ async function connectFreshSocket() {
             return;
           }
 
+          if (state.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+            state.lastError = state.lastError ?? "Limite de reconexoes atingido";
+            state.nextRetryAt = null;
+            await updateSessionDoc({
+              last_error: state.lastError,
+              next_retry_at: null,
+              reconnect_attempts: state.reconnectAttempts,
+            });
+            await writeMessageLog({
+              kind: "error",
+              status: "reconnect_limit_reached",
+              detail: state.lastError,
+            });
+            return;
+          }
+
           const nextAttempt = Math.min(state.reconnectAttempts + 1, RECONNECT_MAX_ATTEMPTS);
           state.reconnectAttempts = nextAttempt;
           const reconnectDelay = isDisconnectCode(code, DisconnectReason.restartRequired) ? 1000 : computeReconnectDelay(nextAttempt);
@@ -643,16 +609,19 @@ async function connectFreshSocket() {
           clearReconnectTimer(state);
           state.reconnectTimer = setTimeout(() => {
             state.reconnectTimer = null;
-            void connectFreshSocket().catch(async (error) => {
-              const detail = error instanceof Error ? error.message : "Falha ao reconectar";
-              state.lastError = detail;
-              await updateSessionDoc({ last_error: detail });
-              await writeMessageLog({
-                kind: "error",
-                status: "reconnect_failed",
-                detail,
+            void (async () => {
+              await waitForAuthWrites();
+              await connectFreshSocket().catch(async (error) => {
+                const detail = error instanceof Error ? error.message : "Falha ao reconectar";
+                state.lastError = detail;
+                await updateSessionDoc({ last_error: detail });
+                await writeMessageLog({
+                  kind: "error",
+                  status: "reconnect_failed",
+                  detail,
+                });
               });
-            });
+            })();
           }, reconnectDelay);
         }
       };
@@ -668,6 +637,7 @@ async function connectFreshSocket() {
         state.socket = null;
         return state;
       }
+
       state.status = "disconnected";
       state.socket = null;
       state.lastError = error instanceof Error ? error.message : "Falha ao iniciar conexao";
@@ -681,20 +651,25 @@ async function connectFreshSocket() {
         detail: state.lastError,
       }).catch(() => undefined);
 
-      const nextAttempt = Math.min(state.reconnectAttempts + 1, RECONNECT_MAX_ATTEMPTS);
-      state.reconnectAttempts = nextAttempt;
-      const reconnectDelay = computeReconnectDelay(nextAttempt);
-      state.nextRetryAt = new Date(Date.now() + reconnectDelay);
-      await updateSessionDoc({
-        reconnect_attempts: state.reconnectAttempts,
-        next_retry_at: state.nextRetryAt,
-      }).catch(() => undefined);
+      if (state.reconnectAttempts < RECONNECT_MAX_ATTEMPTS) {
+        const nextAttempt = Math.min(state.reconnectAttempts + 1, RECONNECT_MAX_ATTEMPTS);
+        state.reconnectAttempts = nextAttempt;
+        const reconnectDelay = computeReconnectDelay(nextAttempt);
+        state.nextRetryAt = new Date(Date.now() + reconnectDelay);
+        await updateSessionDoc({
+          reconnect_attempts: state.reconnectAttempts,
+          next_retry_at: state.nextRetryAt,
+        }).catch(() => undefined);
 
-      clearReconnectTimer(state);
-      state.reconnectTimer = setTimeout(() => {
-        state.reconnectTimer = null;
-        void connectFreshSocket().catch(() => undefined);
-      }, reconnectDelay);
+        clearReconnectTimer(state);
+        state.reconnectTimer = setTimeout(() => {
+          state.reconnectTimer = null;
+          void (async () => {
+            await waitForAuthWrites();
+            await connectFreshSocket().catch(() => undefined);
+          })();
+        }, reconnectDelay);
+      }
     } finally {
       state.connectPromise = null;
     }
@@ -724,7 +699,7 @@ async function waitForConnectedSocket(timeoutMs = SEND_WAIT_TIMEOUT_MS) {
 
 function trackRecentMessage(numero: string, mensagem: string) {
   pruneRecentMessages();
-  const key = `${SESSION_TENANT_ID}:${numero}:${mensagem}`;
+  const key = `${numero}:${mensagem}`;
   const now = Date.now();
   const lastSent = recentMessages.get(key);
   if (lastSent && now - lastSent < MESSAGE_DEDUPE_WINDOW_MS) {
@@ -734,8 +709,18 @@ function trackRecentMessage(numero: string, mensagem: string) {
   return true;
 }
 
+function enqueueSend<T>(task: () => Promise<T>) {
+  const nextTask = state.writeChain.then(task, task);
+  state.writeChain = nextTask.then(() => undefined, () => undefined);
+  return nextTask;
+}
+
 export async function startBaileysSession() {
+  if (state.socket) {
+    await stopBaileysSession();
+  }
   state.stopRequested = false;
+  clearReconnectTimer(state);
   return connectFreshSocket();
 }
 
@@ -760,12 +745,10 @@ export async function stopAllBaileysSessions() {
 }
 
 export async function getSessionStatus() {
-  await connectMongo();
   await ensureSessionDocument();
-  const sessionDoc = await WhatsAppSession.findOne(getSessionFilter()).lean().exec();
+  const sessionDocId = await resolveSessionDocId();
+  const sessionDoc = await WhatsAppSession.findById(sessionDocId).lean().exec();
   return {
-    tenant_id: SESSION_TENANT_ID,
-    session_id: getSessionAlias(),
     name: typeof sessionDoc?.name === "string" && sessionDoc.name.trim() ? sessionDoc.name : null,
     status: state.status,
     qr: state.qr,
@@ -779,24 +762,11 @@ export async function getSessionStatus() {
 }
 
 export async function updateSessionMetadata(metadata: { name?: string | null }) {
-  await connectMongo();
-  await ensureSessionDocument();
   const name = typeof metadata.name === "string" && metadata.name.trim() ? metadata.name.trim() : null;
-  await WhatsAppSession.updateOne(
-    getSessionWriteFilter(),
-    {
-      $set: {
-        tenant_id: SESSION_TENANT_ID,
-        session_id: SESSION_ID,
-        name,
-      },
-    },
-    { upsert: true }
-  ).exec();
+  await updateSessionDoc({ name });
 }
 
 export async function sendWhatsAppMessage(numero: string, mensagem: string) {
-  await connectMongo();
   await ensureSessionDocument();
   const normalizedNumber = normalizePhoneNumber(numero);
   const messageText = mensagem.trim();
@@ -833,8 +803,6 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string) {
     });
 
     emitRealtime("whatsapp:message-sent", {
-      session_id: SESSION_ID,
-      tenant_id: SESSION_TENANT_ID,
       numero: normalizedNumber,
       status: "sent",
       message_id: result?.key?.id ?? null,
@@ -844,16 +812,9 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string) {
   });
 }
 
-function enqueueSend<T>(task: () => Promise<T>) {
-  const nextTask = state.writeChain.then(task, task);
-  state.writeChain = nextTask.then(() => undefined, () => undefined);
-  return nextTask;
-}
-
 export async function getCompanyLogs() {
-  await connectMongo();
   await ensureSessionDocument();
-  return MessageLog.find(getSessionFilter()).sort({ created_at: -1 }).limit(200).lean().exec();
+  return MessageLog.find({}).sort({ created_at: -1 }).limit(200).lean().exec();
 }
 
 export async function ensureWhatsAppBoot() {

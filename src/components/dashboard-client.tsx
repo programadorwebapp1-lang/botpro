@@ -6,7 +6,6 @@ import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import Image from "next/image";
 
 type StatusPayload = {
-  tenant_id?: string;
   status: string;
   qr: string | null;
   numero: string | null;

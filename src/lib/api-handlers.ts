@@ -108,7 +108,6 @@ function formatStatusResponse(status: Awaited<ReturnType<typeof getSessionStatus
   return {
     ok: true,
     ...status,
-    tenant_id: status.tenant_id,
     connected: status.status === "connected",
     phone: status.numero ?? null,
   };
@@ -156,7 +155,6 @@ export async function handleCreateSessionRequest(request: Request) {
 
     const status = await getSessionStatus();
     return NextResponse.json({
-      requested_session_id: status.session_id,
       ...formatStatusResponse(status),
     });
   } catch (error) {
@@ -203,15 +201,12 @@ export async function handleSendMessageRequest(request: Request) {
     });
 
     const result = await sendWhatsAppMessage(number, message);
-    const status = await getSessionStatus();
 
     return NextResponse.json({
       ok: true,
       status: "sent",
       number,
       message,
-      tenant_id: status.tenant_id,
-      session_id: status.session_id,
       message_id: result.message_id,
     });
   } catch (error) {

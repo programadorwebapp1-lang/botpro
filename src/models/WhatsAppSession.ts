@@ -1,10 +1,7 @@
 import { Schema, model, models } from "mongoose";
-import { DEFAULT_TENANT_ID } from "@/lib/app-config";
 
 const WhatsAppSessionSchema = new Schema(
   {
-    tenant_id: { type: String, required: true, unique: true, index: true, default: DEFAULT_TENANT_ID },
-    session_id: { type: String, required: true, unique: true, index: true },
     name: { type: String, required: false, default: null },
     creds: { type: Schema.Types.Mixed, required: true, default: {} },
     keys: { type: Schema.Types.Mixed, required: true, default: {} },
@@ -22,7 +19,6 @@ const WhatsAppSessionSchema = new Schema(
   }
 );
 
-WhatsAppSessionSchema.index({ tenant_id: 1, updatedAt: -1 });
 WhatsAppSessionSchema.index({ status: 1, updatedAt: -1 });
 
 export default models.WhatsAppSession || model("WhatsAppSession", WhatsAppSessionSchema);
