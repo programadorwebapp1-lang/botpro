@@ -10,6 +10,7 @@ import makeWASocket, {
   type SignalKeyStore,
 } from "@whiskeysockets/baileys";
 import { delay } from "@whiskeysockets/baileys";
+import pino from "pino";
 import { connectMongo } from "./mongo";
 import { jidFromPhone, normalizePhoneNumber } from "./wa-utils";
 import { emitRealtime } from "./realtime";
@@ -41,6 +42,10 @@ type RuntimeState = {
   socketGeneration: number;
   authCache: AuthCache | null;
   sessionDocId: string | null;
+  authFlushTimer: NodeJS.Timeout | null;
+  pendingAuthCreds: AuthenticationState["creds"] | null;
+  pendingAuthSet: Record<string, unknown>;
+  pendingAuthUnset: Record<string, string>;
 };
 
 type ConnectionUpdate = {
@@ -57,12 +62,14 @@ type ConnectionUpdate = {
 const MESSAGE_LOG_TTL_DAYS = Number(process.env.MESSAGE_LOG_TTL_DAYS ?? 30);
 const RECONNECT_BASE_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_BASE_MS ?? 1500);
 const RECONNECT_MAX_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_MAX_MS ?? 60000);
-const RECONNECT_MAX_ATTEMPTS = Number(process.env.WHATSAPP_RECONNECT_MAX_ATTEMPTS ?? 8);
-const AUTH_RESET_MAX_ATTEMPTS = Number(process.env.WHATSAPP_AUTH_RESET_MAX_ATTEMPTS ?? 2);
+const RECONNECT_MAX_ATTEMPTS = Number(process.env.WHATSAPP_RECONNECT_MAX_ATTEMPTS ?? 4);
+const AUTH_RESET_MAX_ATTEMPTS = Number(process.env.WHATSAPP_AUTH_RESET_MAX_ATTEMPTS ?? 0);
 const SEND_DELAY_MS = Number(process.env.WHATSAPP_SEND_DELAY_MS ?? 900);
 const SEND_WAIT_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_WAIT_TIMEOUT_MS ?? 15000);
 const MESSAGE_DEDUPE_WINDOW_MS = Number(process.env.WHATSAPP_MESSAGE_DEDUPE_WINDOW_MS ?? 15000);
 const MAX_MESSAGE_LENGTH = Number(process.env.WHATSAPP_MAX_MESSAGE_LENGTH ?? 4096);
+const AUTH_FLUSH_DEBOUNCE_MS = Number(process.env.WHATSAPP_AUTH_FLUSH_DEBOUNCE_MS ?? 250);
+const silentLogger = pino({ level: "silent" });
 
 const state = createRuntimeState();
 const recentMessages = new Map<string, number>();
@@ -87,6 +94,10 @@ function createRuntimeState(): RuntimeState {
     socketGeneration: 0,
     authCache: null,
     sessionDocId: null,
+    authFlushTimer: null,
+    pendingAuthCreds: null,
+    pendingAuthSet: {},
+    pendingAuthUnset: {},
   };
 }
 
@@ -194,7 +205,74 @@ function pruneRecentMessages() {
 }
 
 function waitForAuthWrites() {
-  return state.authWriteChain.catch(() => undefined);
+  if (state.authFlushTimer) {
+    clearTimeout(state.authFlushTimer);
+    state.authFlushTimer = null;
+  }
+  return flushPendingAuthWrites();
+}
+
+function scheduleAuthFlush() {
+  if (state.authFlushTimer) {
+    clearTimeout(state.authFlushTimer);
+  }
+  state.authFlushTimer = setTimeout(() => {
+    state.authFlushTimer = null;
+    void flushPendingAuthWrites().catch(() => undefined);
+  }, AUTH_FLUSH_DEBOUNCE_MS);
+}
+
+function queueAuthSet(path: string, value: unknown) {
+  state.pendingAuthUnset[path] = "";
+  delete state.pendingAuthSet[path];
+  state.pendingAuthSet[path] = value;
+}
+
+function queueAuthUnset(path: string) {
+  delete state.pendingAuthSet[path];
+  state.pendingAuthUnset[path] = "";
+}
+
+function queueAuthCredsSnapshot(snapshot: AuthenticationState["creds"]) {
+  state.pendingAuthCreds = snapshot;
+}
+
+async function flushPendingAuthWrites() {
+  const sessionDocId = await resolveSessionDocId();
+  const snapshotCreds = state.pendingAuthCreds;
+  const snapshotSet = { ...state.pendingAuthSet };
+  const snapshotUnset = { ...state.pendingAuthUnset };
+
+  if (
+    snapshotCreds == null &&
+    Object.keys(snapshotSet).length === 0 &&
+    Object.keys(snapshotUnset).length === 0
+  ) {
+    return;
+  }
+
+  state.pendingAuthCreds = null;
+  state.pendingAuthSet = {};
+  state.pendingAuthUnset = {};
+
+  state.authWriteChain = state.authWriteChain.then(
+    async () => {
+      const update: Record<string, unknown> = {};
+      if (snapshotCreds != null) {
+        update.$set = { ...(update.$set as Record<string, unknown> | undefined), creds: snapshotCreds };
+      }
+      if (Object.keys(snapshotSet).length) {
+        update.$set = { ...(update.$set as Record<string, unknown> | undefined), ...snapshotSet };
+      }
+      if (Object.keys(snapshotUnset).length) {
+        update.$unset = snapshotUnset;
+      }
+      await WhatsAppSession.updateOne({ _id: sessionDocId }, update).exec();
+    },
+    async () => undefined
+  );
+
+  await state.authWriteChain;
 }
 
 async function resolveSessionDocId() {
@@ -277,14 +355,8 @@ async function loadAuthState(): Promise<{
       return;
     }
 
-    const credsSnapshot = serializeValue(state.authCache.creds);
-    state.authWriteChain = state.authWriteChain.then(
-      async () => {
-        await WhatsAppSession.updateOne({ _id: sessionDocId }, { $set: { creds: credsSnapshot } }).exec();
-      },
-      async () => undefined
-    );
-    await state.authWriteChain;
+    queueAuthCredsSnapshot(serializeValue(state.authCache.creds));
+    scheduleAuthFlush();
   };
 
   const keysStore = {
@@ -317,9 +389,6 @@ async function loadAuthState(): Promise<{
         };
       }
 
-      const $set: Record<string, unknown> = {};
-      const $unset: Record<string, string> = {};
-
       for (const [category, entries] of Object.entries(data)) {
         const keyCategory = category as keyof AuthCache["keys"];
         state.authCache.keys[keyCategory] ??= {};
@@ -328,32 +397,17 @@ async function loadAuthState(): Promise<{
           const path = `keys.${category}.${encodeAuthId(id)}`;
           if (value == null) {
             delete state.authCache.keys[keyCategory][encodeAuthId(id)];
-            $unset[path] = "";
+            queueAuthUnset(path);
             continue;
           }
 
           const serialized = serializeValue(value);
           state.authCache.keys[keyCategory][encodeAuthId(id)] = serialized;
-          $set[path] = serialized;
+          queueAuthSet(path, serialized);
         }
       }
 
-      state.authWriteChain = state.authWriteChain.then(
-        async () => {
-          const update: Record<string, unknown> = {};
-          if (Object.keys($set).length) {
-            update.$set = $set;
-          }
-          if (Object.keys($unset).length) {
-            update.$unset = $unset;
-          }
-          if (Object.keys(update).length) {
-            await WhatsAppSession.updateOne({ _id: sessionDocId }, update).exec();
-          }
-        },
-        async () => undefined
-      );
-      await state.authWriteChain;
+      scheduleAuthFlush();
     },
     clear: async () => {
       if (!state.authCache) {
@@ -365,21 +419,10 @@ async function loadAuthState(): Promise<{
 
       state.authCache.creds = initAuthCreds();
       state.authCache.keys = {};
-      state.authWriteChain = state.authWriteChain.then(
-        async () => {
-          await WhatsAppSession.updateOne(
-            { _id: sessionDocId },
-            {
-              $set: {
-                creds: serializeValue(state.authCache!.creds),
-                keys: {},
-              },
-            }
-          ).exec();
-        },
-        async () => undefined
-      );
-      await state.authWriteChain;
+      state.pendingAuthCreds = serializeValue(state.authCache.creds);
+      state.pendingAuthSet = { keys: {} };
+      state.pendingAuthUnset = {};
+      await flushPendingAuthWrites();
     },
   } satisfies SignalKeyStore & { clear: () => Promise<void> };
 
@@ -436,15 +479,26 @@ async function connectFreshSocket() {
 
       const { version } = await fetchLatestBaileysVersion();
       const sock = makeWASocket({
+        logger: silentLogger,
         version,
         auth: {
           creds: authState.creds,
           keys: authState.keys,
         },
+        emitOwnEvents: false,
         printQRInTerminal: false,
         generateHighQualityLinkPreview: true,
         markOnlineOnConnect: true,
         syncFullHistory: false,
+        fireInitQueries: false,
+        retryRequestDelayMs: 500,
+        maxMsgRetryCount: 1,
+        transactionOpts: {
+          maxCommitRetries: 1,
+          delayBetweenTriesMs: 100,
+        },
+        enableAutoSessionRecreation: false,
+        enableRecentMessageCache: true,
       });
 
       state.socketGeneration += 1;
@@ -600,27 +654,12 @@ async function connectFreshSocket() {
             reconnect_attempts: state.reconnectAttempts,
             next_retry_at: state.nextRetryAt,
           });
-          await writeMessageLog({
-            kind: "system",
-            status: "reconnect_scheduled",
-            detail: `Reconnect scheduled in ${reconnectDelay}ms (attempt ${state.reconnectAttempts})`,
-          });
-
           clearReconnectTimer(state);
           state.reconnectTimer = setTimeout(() => {
             state.reconnectTimer = null;
             void (async () => {
               await waitForAuthWrites();
-              await connectFreshSocket().catch(async (error) => {
-                const detail = error instanceof Error ? error.message : "Falha ao reconectar";
-                state.lastError = detail;
-                await updateSessionDoc({ last_error: detail });
-                await writeMessageLog({
-                  kind: "error",
-                  status: "reconnect_failed",
-                  detail,
-                });
-              });
+              await connectFreshSocket().catch(() => undefined);
             })();
           }, reconnectDelay);
         }
@@ -645,12 +684,6 @@ async function connectFreshSocket() {
         status: state.status,
         last_error: state.lastError,
       }).catch(() => undefined);
-      await writeMessageLog({
-        kind: "error",
-        status: "start_failed",
-        detail: state.lastError,
-      }).catch(() => undefined);
-
       if (state.reconnectAttempts < RECONNECT_MAX_ATTEMPTS) {
         const nextAttempt = Math.min(state.reconnectAttempts + 1, RECONNECT_MAX_ATTEMPTS);
         state.reconnectAttempts = nextAttempt;
