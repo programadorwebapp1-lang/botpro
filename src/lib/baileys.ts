@@ -241,7 +241,7 @@ function isAuthShapeError(error: unknown) {
 }
 
 function encodeAuthId(id: string) {
-  return encodeURIComponent(id);
+  return encodeURIComponent(id).replace(/\./g, "%2E").replace(/\$/g, "%24");
 }
 
 function persistSessionPatch(sessionId: string, patch: Record<string, unknown>) {
@@ -344,7 +344,7 @@ async function loadAuthState(sessionId: string): Promise<{
         last_qr_at: null,
       },
     },
-    { new: true, upsert: true }
+    { upsert: true, returnDocument: "after" }
   ).lean().exec();
 
   const storedCreds = session?.creds ? (reviveValue(session.creds) as Partial<AuthenticationState["creds"]>) : null;
