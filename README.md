@@ -1,25 +1,31 @@
 # WhatsApp ERP Bot
 
-Sistema interno de WhatsApp Web com Baileys, Next.js, MongoDB e Socket.IO, pensado para uso privado com ERP Flask.
+Bot interno de WhatsApp Web com Baileys, Next.js e MongoDB, pensado para uso privado com ERP Flask.
+
+## Arquitetura
+
+- 1 sessao WhatsApp unica
+- Persistencia da sessao no MongoDB
+- Reconnect automatico com backoff
+- Integração via API Bearer Token
+- Compatibilidade com Render
 
 ## Recursos
 
-- Conexão com WhatsApp via Baileys
-- Sessão persistida no MongoDB
-- Suporte incremental a múltiplos tenants/sessões
-- Reconexão automática com backoff
-- QR Code no dashboard
+- Conexao com WhatsApp via Baileys
+- Sessao persistida no MongoDB
 - Envio de mensagens via API
 - Logs em MongoDB com TTL
-- Autenticação por `Authorization: Bearer`
-- Atualização em tempo real com Socket.IO
+- Endpoint de status
+- Endpoint de health
+- Reconnect manual
 
 ## Requisitos
 
 - Node.js 20+
 - MongoDB Atlas ou local
 
-## Variáveis de ambiente
+## Variaveis de ambiente
 
 Crie um arquivo `.env` na raiz com:
 
@@ -36,9 +42,9 @@ WHATSAPP_RECONNECT_MAX_MS=60000
 WHATSAPP_SEND_DELAY_MS=900
 ```
 
-Se você tiver legado usando `MONGO_URI`, o projeto também aceita esse nome.
+Se voce tiver legado usando `MONGO_URI`, o projeto tambem aceita esse nome.
 
-## Execução local
+## Execucao local
 
 ```bash
 npm install
@@ -78,31 +84,14 @@ Tambem disponivel em:
 
 ### Sessao
 
-Cria ou inicia uma sessao isolada por `tenant_id` e retorna o status atual, incluindo `qr` quando a conexao ainda nao foi concluida.
+Consulta o status da sessao unica do bot:
 
 ```http
-POST /sessions/create
-```
-
-Body:
-
-```json
-{
-  "tenant_id": "11111111111111",
-  "session_id": "11111111111111",
-  "name": "Empresa XYZ"
-}
-```
-
-Consulta o status da sessao:
-
-```http
-GET /sessions/status?tenant_id=11111111111111
+GET /sessions/status
 ```
 
 Tambem disponivel em:
 
-- `POST /api/sessions/create`
 - `GET /api/sessions/status`
 
 ### Logs
@@ -122,12 +111,9 @@ Body:
 ```json
 {
   "number": "556892281187",
-  "message": "Teste local do ERP",
-  "tenant_id": "default"
+  "message": "Teste local do ERP"
 }
 ```
-
-Se `tenant_id` não for enviado, o sistema usa automaticamente `default` e mantém a sessão atual compatível com o fluxo antigo.
 
 Tambem disponivel em:
 
@@ -138,8 +124,6 @@ Tambem disponivel em:
 ```http
 POST /api/connect
 ```
-
-Também aceita `tenant_id` para abrir ou reconectar sessões de outras empresas sem afetar o tenant padrão.
 
 ### Healthcheck
 
@@ -154,9 +138,9 @@ Tambem disponivel em:
 ## Deploy no Render
 
 1. Crie um novo Web Service.
-2. Aponte para este repositório.
+2. Aponte para este repositorio.
 3. Use Node.js.
-4. Configure as variáveis de ambiente.
+4. Configure as variaveis de ambiente.
 5. Build command:
 
 ```bash
@@ -169,7 +153,7 @@ npm install && npm run build
 npm start
 ```
 
-## Integração com ERP
+## Integracao com ERP
 
 No ERP Flask, configure:
 
@@ -178,7 +162,7 @@ WHATSAPP_API_URL=https://seu-bot.onrender.com
 WHATSAPP_API_TOKEN=mesmo_token_do_render
 ```
 
-Para enviar mensagem, faça `POST` em `/send-message` com o header:
+Para enviar mensagem, faca `POST` em `/send-message` com o header:
 
 ```http
 Authorization: Bearer SEU_TOKEN

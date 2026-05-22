@@ -19,6 +19,11 @@ import MessageLog from "@/models/MessageLog";
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected";
 
+type AuthCache = {
+  creds: AuthenticationState["creds"];
+  keys: Record<string, Record<string, unknown>>;
+};
+
 type RuntimeState = {
   socket: ReturnType<typeof makeWASocket> | null;
   connectPromise: Promise<RuntimeState> | null;
@@ -34,6 +39,7 @@ type RuntimeState = {
   authResetAttempts: number;
   writeChain: Promise<void>;
   socketGeneration: number;
+  authCache: AuthCache | null;
 };
 
 type ConnectionUpdate = {
@@ -47,7 +53,8 @@ type ConnectionUpdate = {
   };
 };
 
-const SESSION_ID = DEFAULT_TENANT_ID;
+const SESSION_TENANT_ID = DEFAULT_TENANT_ID;
+const SESSION_ID = LEGACY_SESSION_ID;
 const MESSAGE_LOG_TTL_DAYS = Number(process.env.MESSAGE_LOG_TTL_DAYS ?? 30);
 const RECONNECT_BASE_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_BASE_MS ?? 1500);
 const RECONNECT_MAX_DELAY_MS = Number(process.env.WHATSAPP_RECONNECT_MAX_MS ?? 60000);
@@ -57,7 +64,8 @@ const SEND_DELAY_MS = Number(process.env.WHATSAPP_SEND_DELAY_MS ?? 900);
 const SEND_WAIT_TIMEOUT_MS = Number(process.env.WHATSAPP_SEND_WAIT_TIMEOUT_MS ?? 15000);
 const MESSAGE_DEDUPE_WINDOW_MS = Number(process.env.WHATSAPP_MESSAGE_DEDUPE_WINDOW_MS ?? 15000);
 const MAX_MESSAGE_LENGTH = Number(process.env.WHATSAPP_MAX_MESSAGE_LENGTH ?? 4096);
-const sessions = new Map<string, RuntimeState>();
+
+const state = createRuntimeState();
 const recentMessages = new Map<string, number>();
 let bootPromise: Promise<void> | null = null;
 
@@ -77,70 +85,44 @@ function createRuntimeState(): RuntimeState {
     authResetAttempts: 0,
     writeChain: Promise.resolve(),
     socketGeneration: 0,
+    authCache: null,
   };
 }
 
-function getState(sessionId = SESSION_ID) {
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, createRuntimeState());
-  }
-  return sessions.get(sessionId)!;
-}
-
-function getSessionAlias(sessionId: string) {
-  return sessionId === DEFAULT_TENANT_ID ? LEGACY_SESSION_ID : sessionId;
-}
-
-function buildSessionFilter(sessionId: string) {
-  const alias = getSessionAlias(sessionId);
-  if (alias === sessionId) {
-    return { tenant_id: sessionId };
-  }
+function getSessionFilter() {
   return {
-    $or: [{ tenant_id: sessionId }, { session_id: alias }],
+    $or: [{ tenant_id: SESSION_TENANT_ID }, { session_id: SESSION_ID }],
   };
 }
 
-function buildLogFilter(sessionId: string) {
-  const alias = getSessionAlias(sessionId);
-  if (alias === sessionId) {
-    return {
-      $or: [{ tenant_id: sessionId }, { session_id: sessionId }],
-    };
-  }
-
-  return {
-    $or: [{ tenant_id: sessionId }, { session_id: alias }],
-  };
+function getSessionWriteFilter() {
+  return { tenant_id: SESSION_TENANT_ID };
 }
 
-async function migrateLegacyDefaultSession() {
+function getSessionAlias() {
+  return SESSION_ID;
+}
+
+async function normalizeSessionDocument() {
   await connectMongo();
 
   const [defaultDoc, legacyDoc] = await Promise.all([
-    WhatsAppSession.findOne({ tenant_id: DEFAULT_TENANT_ID }).lean().exec(),
-    WhatsAppSession.findOne({ session_id: LEGACY_SESSION_ID }).lean().exec(),
+    WhatsAppSession.findOne({ tenant_id: SESSION_TENANT_ID }).lean().exec(),
+    WhatsAppSession.findOne({ session_id: SESSION_ID }).lean().exec(),
   ]);
 
-  if (!legacyDoc && !defaultDoc) {
-    return;
-  }
-
-  if (defaultDoc && !legacyDoc) {
-    return;
-  }
-
   if (defaultDoc && legacyDoc && String(defaultDoc._id) !== String(legacyDoc._id)) {
-    const preferLegacy = !isUsableAuthCreds(defaultDoc.creds as Partial<AuthenticationState["creds"]>) &&
-      isUsableAuthCreds(legacyDoc.creds as Partial<AuthenticationState["creds"]>);
+    const preferLegacy =
+      !isUsableAuthCreds(defaultDoc.creds as Partial<AuthenticationState["creds"]> | null | undefined) &&
+      isUsableAuthCreds(legacyDoc.creds as Partial<AuthenticationState["creds"]> | null | undefined);
     const source = preferLegacy ? legacyDoc : defaultDoc;
 
     await WhatsAppSession.updateOne(
       { _id: defaultDoc._id },
       {
         $set: {
-          tenant_id: DEFAULT_TENANT_ID,
-          session_id: LEGACY_SESSION_ID,
+          tenant_id: SESSION_TENANT_ID,
+          session_id: SESSION_ID,
           creds: source.creds,
           keys: source.keys,
           status: source.status,
@@ -153,52 +135,33 @@ async function migrateLegacyDefaultSession() {
         },
       }
     ).exec();
-
-    await WhatsAppSession.deleteOne({ _id: legacyDoc._id }).exec();
     return;
   }
 
-  const sourceDoc = defaultDoc ?? legacyDoc;
-  if (!sourceDoc) {
-    return;
-  }
-
-  await WhatsAppSession.updateOne(
-    { _id: sourceDoc._id },
-    {
-      $set: {
-        tenant_id: DEFAULT_TENANT_ID,
-        session_id: LEGACY_SESSION_ID,
-      },
-    }
-  ).exec();
-}
-
-async function ensureSessionDocument(sessionId: string) {
-  await connectMongo();
-
-  if (sessionId === DEFAULT_TENANT_ID) {
-    await migrateLegacyDefaultSession();
-  }
-
-  const existing = await WhatsAppSession.findOne(buildSessionFilter(sessionId)).lean().exec();
-  if (existing) {
-    const desiredSessionId = getSessionAlias(sessionId);
-    if (existing.tenant_id !== sessionId || existing.session_id !== desiredSessionId) {
+  if (defaultDoc) {
+    if (defaultDoc.session_id !== SESSION_ID) {
       await WhatsAppSession.updateOne(
-        { _id: existing._id },
-        { $set: { tenant_id: sessionId, session_id: desiredSessionId } }
+        { _id: defaultDoc._id },
+        { $set: { tenant_id: SESSION_TENANT_ID, session_id: SESSION_ID } }
       ).exec();
     }
     return;
   }
 
+  if (legacyDoc) {
+    await WhatsAppSession.updateOne(
+      { _id: legacyDoc._id },
+      { $set: { tenant_id: SESSION_TENANT_ID, session_id: SESSION_ID } }
+    ).exec();
+    return;
+  }
+
   await WhatsAppSession.updateOne(
-    { tenant_id: sessionId },
+    { tenant_id: SESSION_TENANT_ID },
     {
       $setOnInsert: {
-        tenant_id: sessionId,
-        session_id: getSessionAlias(sessionId),
+        tenant_id: SESSION_TENANT_ID,
+        session_id: SESSION_ID,
         creds: serializeValue(initAuthCreds()),
         keys: {},
         status: "idle",
@@ -212,6 +175,10 @@ async function ensureSessionDocument(sessionId: string) {
     },
     { upsert: true }
   ).exec();
+}
+
+async function ensureSessionDocument() {
+  await normalizeSessionDocument();
 }
 
 function serializeValue<T>(value: T) {
@@ -244,22 +211,10 @@ function encodeAuthId(id: string) {
   return encodeURIComponent(id).replace(/\./g, "%2E").replace(/\$/g, "%24");
 }
 
-function persistSessionPatch(sessionId: string, patch: Record<string, unknown>) {
-  const state = getState(sessionId);
-  state.writeChain = state.writeChain.then(async () => {
-    await WhatsAppSession.updateOne(
-      buildSessionFilter(sessionId),
-      { $set: { ...patch, tenant_id: sessionId, session_id: getSessionAlias(sessionId) } },
-      { upsert: true }
-    ).exec();
-  }, async () => undefined);
-  return state.writeChain;
-}
-
-function clearReconnectTimer(state: RuntimeState) {
-  if (state.reconnectTimer) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
+function clearReconnectTimer(runtime: RuntimeState) {
+  if (runtime.reconnectTimer) {
+    clearTimeout(runtime.reconnectTimer);
+    runtime.reconnectTimer = null;
   }
 }
 
@@ -298,7 +253,7 @@ function pruneRecentMessages() {
   }
 }
 
-async function writeMessageLog(sessionId: string, payload: {
+async function writeMessageLog(payload: {
   kind: "message" | "system" | "error";
   status: string;
   numero?: string;
@@ -308,31 +263,43 @@ async function writeMessageLog(sessionId: string, payload: {
   provider_message_id?: string;
 }) {
   const log = await MessageLog.create({
-    tenant_id: sessionId,
-    session_id: getSessionAlias(sessionId),
+    tenant_id: SESSION_TENANT_ID,
+    session_id: SESSION_ID,
     expire_at: buildMessageLogExpireAt(),
     ...payload,
   });
-  emitRealtime("log:new", { session_id: sessionId, log });
+  emitRealtime("log:new", { session_id: SESSION_ID, log });
   return log;
 }
 
-async function updateSessionDoc(sessionId: string, patch: Record<string, unknown>) {
-  await persistSessionPatch(sessionId, patch);
+async function persistSessionPatch(patch: Record<string, unknown>) {
+  state.writeChain = state.writeChain.then(async () => {
+    await WhatsAppSession.updateOne(
+      getSessionWriteFilter(),
+      { $set: { ...patch, tenant_id: SESSION_TENANT_ID, session_id: SESSION_ID } },
+      { upsert: true }
+    ).exec();
+  }, async () => undefined);
+  return state.writeChain;
 }
 
-async function loadAuthState(sessionId: string): Promise<{
+async function updateSessionDoc(patch: Record<string, unknown>) {
+  await persistSessionPatch(patch);
+}
+
+async function loadAuthState(): Promise<{
   state: AuthenticationState;
   saveCreds: () => Promise<void>;
   resetAuth: () => Promise<void>;
 }> {
-  await ensureSessionDocument(sessionId);
+  await ensureSessionDocument();
+
   const session = await WhatsAppSession.findOneAndUpdate(
-    buildSessionFilter(sessionId),
+    getSessionFilter(),
     {
       $setOnInsert: {
-        tenant_id: sessionId,
-        session_id: getSessionAlias(sessionId),
+        tenant_id: SESSION_TENANT_ID,
+        session_id: SESSION_ID,
         creds: serializeValue(initAuthCreds()),
         keys: {},
         status: "idle",
@@ -348,21 +315,30 @@ async function loadAuthState(sessionId: string): Promise<{
   ).lean().exec();
 
   const storedCreds = session?.creds ? (reviveValue(session.creds) as Partial<AuthenticationState["creds"]>) : null;
-  let creds = isUsableAuthCreds(storedCreds) ? storedCreds : initAuthCreds();
+  const storedKeys = session?.keys ? (reviveValue(session.keys) as AuthCache["keys"]) : {};
+
+  const cache: AuthCache = {
+    creds: isUsableAuthCreds(storedCreds) ? storedCreds : initAuthCreds(),
+    keys: storedKeys && typeof storedKeys === "object" ? storedKeys : {},
+  };
+  state.authCache = cache;
 
   const saveCreds = async () => {
-    await updateSessionDoc(sessionId, {
-      creds: serializeValue(creds),
+    if (!state.authCache) {
+      return;
+    }
+    await updateSessionDoc({
+      creds: serializeValue(state.authCache.creds),
     });
   };
 
   const keysStore = {
     get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
-      const current = await WhatsAppSession.findOne(buildSessionFilter(sessionId)).lean().exec();
       const result = {} as Record<string, SignalDataTypeMap[T]>;
+      const typeStore = state.authCache?.keys?.[type as string] ?? {};
 
       for (const id of ids) {
-        const stored = current?.keys?.[type]?.[encodeAuthId(id)];
+        const stored = typeStore[encodeAuthId(id)];
         if (stored == null) {
           result[id] = undefined as never;
           continue;
@@ -379,28 +355,42 @@ async function loadAuthState(sessionId: string): Promise<{
       return result;
     },
     set: async (data) => {
+      if (!state.authCache) {
+        state.authCache = {
+          creds: initAuthCreds(),
+          keys: {},
+        };
+      }
+
       const $set: Record<string, unknown> = {};
       const $unset: Record<string, string> = {};
 
       for (const [category, entries] of Object.entries(data)) {
+        const keyCategory = category as keyof AuthCache["keys"];
+        state.authCache.keys[keyCategory] ??= {};
+
         for (const [id, value] of Object.entries(entries)) {
           const path = `keys.${category}.${encodeAuthId(id)}`;
           if (value == null) {
+            delete state.authCache.keys[keyCategory][encodeAuthId(id)];
             $unset[path] = "";
             continue;
           }
-          $set[path] = serializeValue(value);
+
+          const serialized = serializeValue(value);
+          state.authCache.keys[keyCategory][encodeAuthId(id)] = serialized;
+          $set[path] = serialized;
         }
       }
 
       await WhatsAppSession.updateOne(
-        buildSessionFilter(sessionId),
+        getSessionFilter(),
         {
           ...(Object.keys($set).length ? { $set } : {}),
           ...(Object.keys($unset).length ? { $unset } : {}),
           $setOnInsert: {
-            tenant_id: sessionId,
-            session_id: getSessionAlias(sessionId),
+            tenant_id: SESSION_TENANT_ID,
+            session_id: SESSION_ID,
             creds: serializeValue(initAuthCreds()),
             keys: {},
             status: "idle",
@@ -416,45 +406,57 @@ async function loadAuthState(sessionId: string): Promise<{
       ).exec();
     },
     clear: async () => {
+      if (!state.authCache) {
+        state.authCache = {
+          creds: initAuthCreds(),
+          keys: {},
+        };
+      }
+      state.authCache.creds = initAuthCreds();
+      state.authCache.keys = {};
       await WhatsAppSession.updateOne(
-        buildSessionFilter(sessionId),
+        getSessionFilter(),
         {
           $set: {
-            creds: serializeValue(initAuthCreds()),
+            creds: serializeValue(state.authCache.creds),
             keys: {},
-            tenant_id: sessionId,
-            session_id: getSessionAlias(sessionId),
+            tenant_id: SESSION_TENANT_ID,
+            session_id: SESSION_ID,
           },
         },
         { upsert: true }
       ).exec();
-      creds = initAuthCreds();
     },
   } satisfies SignalKeyStore & { clear: () => Promise<void> };
 
   return {
     state: {
-      creds,
+      creds: cache.creds,
       keys: makeCacheableSignalKeyStore(keysStore),
     },
     saveCreds,
     resetAuth: async () => {
-      creds = initAuthCreds();
+      if (!state.authCache) {
+        state.authCache = {
+          creds: initAuthCreds(),
+          keys: {},
+        };
+      }
+      state.authCache.creds = initAuthCreds();
       await keysStore.clear();
       await saveCreds();
     },
   };
 }
 
-async function connectFreshSocket(sessionId: string) {
-  const state = getState(sessionId);
+async function connectFreshSocket() {
   if (state.socket || state.connectPromise) {
     return state;
   }
 
   state.connectPromise = (async () => {
     await connectMongo();
-    await ensureSessionDocument(sessionId);
+    await ensureSessionDocument();
     if (state.stopRequested) {
       state.status = "disconnected";
       return state;
@@ -462,7 +464,7 @@ async function connectFreshSocket(sessionId: string) {
     state.stopRequested = false;
     state.status = "connecting";
     state.lastError = null;
-    await updateSessionDoc(sessionId, {
+    await updateSessionDoc({
       status: state.status,
       last_error: null,
       next_retry_at: null,
@@ -471,7 +473,7 @@ async function connectFreshSocket(sessionId: string) {
     let resetAuth: (() => Promise<void>) | null = null;
 
     try {
-      const { state: authState, saveCreds, resetAuth: resetAuthFn } = await loadAuthState(sessionId);
+      const { state: authState, saveCreds, resetAuth: resetAuthFn } = await loadAuthState();
       resetAuth = resetAuthFn;
       if (state.stopRequested) {
         return state;
@@ -499,6 +501,9 @@ async function connectFreshSocket(sessionId: string) {
           return;
         }
         Object.assign(authState.creds, update);
+        if (state.authCache) {
+          state.authCache.creds = authState.creds;
+        }
         await saveCreds();
       };
 
@@ -511,14 +516,14 @@ async function connectFreshSocket(sessionId: string) {
           state.qr = await import("qrcode").then((mod) => mod.default.toDataURL(update.qr as string));
           state.lastQrAt = new Date();
           state.status = "connecting";
-          await updateSessionDoc(sessionId, {
+          await updateSessionDoc({
             status: state.status,
             qr: state.qr,
             last_qr_at: state.lastQrAt,
           });
           emitRealtime("whatsapp:qr", {
-            session_id: sessionId,
-            tenant_id: sessionId,
+            session_id: SESSION_ID,
+            tenant_id: SESSION_TENANT_ID,
             qr: state.qr,
             status: state.status,
           });
@@ -534,7 +539,7 @@ async function connectFreshSocket(sessionId: string) {
           state.authResetAttempts = 0;
           state.nextRetryAt = null;
           clearReconnectTimer(state);
-          await updateSessionDoc(sessionId, {
+          await updateSessionDoc({
             status: state.status,
             qr: null,
             last_error: null,
@@ -543,12 +548,12 @@ async function connectFreshSocket(sessionId: string) {
             next_retry_at: null,
           });
           emitRealtime("whatsapp:status", {
-            session_id: sessionId,
-            tenant_id: sessionId,
+            session_id: SESSION_ID,
+            tenant_id: SESSION_TENANT_ID,
             status: state.status,
             numero: normalizePhoneNumber(sock.user?.id?.split(":")[0] ?? ""),
           });
-          await writeMessageLog(sessionId, {
+          await writeMessageLog({
             kind: "system",
             status: "connected",
             detail: "WhatsApp connection opened",
@@ -563,18 +568,18 @@ async function connectFreshSocket(sessionId: string) {
           sock.ev.removeAllListeners("creds.update");
           sock.ev.removeAllListeners("connection.update");
 
-          await updateSessionDoc(sessionId, {
+          await updateSessionDoc({
             status: state.status,
             last_error: state.lastError,
           });
 
           emitRealtime("whatsapp:status", {
-            session_id: sessionId,
-            tenant_id: sessionId,
+            session_id: SESSION_ID,
+            tenant_id: SESSION_TENANT_ID,
             status: state.status,
             error: state.lastError,
           });
-          await writeMessageLog(sessionId, {
+          await writeMessageLog({
             kind: "system",
             status: "disconnected",
             detail: `WhatsApp connection closed: ${message}`,
@@ -584,20 +589,17 @@ async function connectFreshSocket(sessionId: string) {
             return;
           }
 
-          if (
-            isDisconnectCode(code, DisconnectReason.loggedOut) ||
-            isDisconnectCode(code, DisconnectReason.badSession)
-          ) {
+          if (isDisconnectCode(code, DisconnectReason.loggedOut) || isDisconnectCode(code, DisconnectReason.badSession)) {
             state.authResetAttempts += 1;
-            await writeMessageLog(sessionId, {
+            await writeMessageLog({
               kind: "error",
               status: "auth_reset",
               detail: `Auth reset triggered after disconnect code ${code ?? "unknown"}`,
             });
 
             if (state.authResetAttempts > AUTH_RESET_MAX_ATTEMPTS) {
-              state.lastError = "Falha repetida de autenticação. QR precisa ser revalidado manualmente.";
-              await updateSessionDoc(sessionId, {
+              state.lastError = "Falha repetida de autenticacao. QR precisa ser revalidado manualmente.";
+              await updateSessionDoc({
                 last_error: state.lastError,
               });
               return;
@@ -611,11 +613,11 @@ async function connectFreshSocket(sessionId: string) {
           }
 
           if (isDisconnectCode(code, DisconnectReason.connectionReplaced)) {
-            state.lastError = "Conexão substituída por outro socket. Auto-reconnect pausado.";
-            await updateSessionDoc(sessionId, {
+            state.lastError = "Conexao substituida por outro socket. Auto-reconnect pausado.";
+            await updateSessionDoc({
               last_error: state.lastError,
             });
-            await writeMessageLog(sessionId, {
+            await writeMessageLog({
               kind: "error",
               status: "connection_replaced",
               detail: state.lastError,
@@ -625,16 +627,14 @@ async function connectFreshSocket(sessionId: string) {
 
           const nextAttempt = Math.min(state.reconnectAttempts + 1, RECONNECT_MAX_ATTEMPTS);
           state.reconnectAttempts = nextAttempt;
-          const reconnectDelay = isDisconnectCode(code, DisconnectReason.restartRequired)
-            ? 1000
-            : computeReconnectDelay(nextAttempt);
+          const reconnectDelay = isDisconnectCode(code, DisconnectReason.restartRequired) ? 1000 : computeReconnectDelay(nextAttempt);
           state.nextRetryAt = new Date(Date.now() + reconnectDelay);
 
-          await updateSessionDoc(sessionId, {
+          await updateSessionDoc({
             reconnect_attempts: state.reconnectAttempts,
             next_retry_at: state.nextRetryAt,
           });
-          await writeMessageLog(sessionId, {
+          await writeMessageLog({
             kind: "system",
             status: "reconnect_scheduled",
             detail: `Reconnect scheduled in ${reconnectDelay}ms (attempt ${state.reconnectAttempts})`,
@@ -643,11 +643,11 @@ async function connectFreshSocket(sessionId: string) {
           clearReconnectTimer(state);
           state.reconnectTimer = setTimeout(() => {
             state.reconnectTimer = null;
-            void connectFreshSocket(sessionId).catch(async (error) => {
+            void connectFreshSocket().catch(async (error) => {
               const detail = error instanceof Error ? error.message : "Falha ao reconectar";
               state.lastError = detail;
-              await updateSessionDoc(sessionId, { last_error: detail });
-              await writeMessageLog(sessionId, {
+              await updateSessionDoc({ last_error: detail });
+              await writeMessageLog({
                 kind: "error",
                 status: "reconnect_failed",
                 detail,
@@ -670,12 +670,12 @@ async function connectFreshSocket(sessionId: string) {
       }
       state.status = "disconnected";
       state.socket = null;
-      state.lastError = error instanceof Error ? error.message : "Falha ao iniciar conexão";
-      await updateSessionDoc(sessionId, {
+      state.lastError = error instanceof Error ? error.message : "Falha ao iniciar conexao";
+      await updateSessionDoc({
         status: state.status,
         last_error: state.lastError,
       }).catch(() => undefined);
-      await writeMessageLog(sessionId, {
+      await writeMessageLog({
         kind: "error",
         status: "start_failed",
         detail: state.lastError,
@@ -685,7 +685,7 @@ async function connectFreshSocket(sessionId: string) {
       state.reconnectAttempts = nextAttempt;
       const reconnectDelay = computeReconnectDelay(nextAttempt);
       state.nextRetryAt = new Date(Date.now() + reconnectDelay);
-      await updateSessionDoc(sessionId, {
+      await updateSessionDoc({
         reconnect_attempts: state.reconnectAttempts,
         next_retry_at: state.nextRetryAt,
       }).catch(() => undefined);
@@ -693,7 +693,7 @@ async function connectFreshSocket(sessionId: string) {
       clearReconnectTimer(state);
       state.reconnectTimer = setTimeout(() => {
         state.reconnectTimer = null;
-        void connectFreshSocket(sessionId).catch(() => undefined);
+        void connectFreshSocket().catch(() => undefined);
       }, reconnectDelay);
     } finally {
       state.connectPromise = null;
@@ -705,12 +705,11 @@ async function connectFreshSocket(sessionId: string) {
   return state.connectPromise;
 }
 
-async function waitForConnectedSocket(sessionId: string, timeoutMs = SEND_WAIT_TIMEOUT_MS) {
+async function waitForConnectedSocket(timeoutMs = SEND_WAIT_TIMEOUT_MS) {
   const startedAt = Date.now();
-  const state = getState(sessionId);
 
   if (!state.socket && !state.connectPromise) {
-    void connectFreshSocket(sessionId).catch(() => undefined);
+    void connectFreshSocket().catch(() => undefined);
   }
 
   while (Date.now() - startedAt < timeoutMs) {
@@ -720,12 +719,12 @@ async function waitForConnectedSocket(sessionId: string, timeoutMs = SEND_WAIT_T
     await delay(500);
   }
 
-  throw new Error("WhatsApp indisponível para envio no momento");
+  throw new Error("WhatsApp indisponivel para envio no momento");
 }
 
-function trackRecentMessage(sessionId: string, numero: string, mensagem: string) {
+function trackRecentMessage(numero: string, mensagem: string) {
   pruneRecentMessages();
-  const key = `${sessionId}:${numero}:${mensagem}`;
+  const key = `${SESSION_TENANT_ID}:${numero}:${mensagem}`;
   const now = Date.now();
   const lastSent = recentMessages.get(key);
   if (lastSent && now - lastSent < MESSAGE_DEDUPE_WINDOW_MS) {
@@ -735,36 +734,12 @@ function trackRecentMessage(sessionId: string, numero: string, mensagem: string)
   return true;
 }
 
-async function getAutoStartTenantIds() {
-  await ensureSessionDocument(DEFAULT_TENANT_ID);
-  const sessions = await WhatsAppSession.find({}).lean().exec();
-  const tenantIds = new Set<string>([DEFAULT_TENANT_ID]);
-
-  for (const session of sessions) {
-    const tenantId = typeof session.tenant_id === "string" && session.tenant_id.trim() ? session.tenant_id : "";
-    const sessionId = typeof session.session_id === "string" && session.session_id.trim() ? session.session_id : "";
-    const resolvedTenantId = tenantId || (sessionId === LEGACY_SESSION_ID ? DEFAULT_TENANT_ID : sessionId);
-    if (!resolvedTenantId) {
-      continue;
-    }
-
-    const hasUsableCreds = isUsableAuthCreds(
-      session.creds as Partial<AuthenticationState["creds"]> | null | undefined
-    );
-    if (resolvedTenantId === DEFAULT_TENANT_ID || hasUsableCreds || session.status === "connected" || session.status === "connecting") {
-      tenantIds.add(resolvedTenantId);
-    }
-  }
-
-  return Array.from(tenantIds);
+export async function startBaileysSession() {
+  state.stopRequested = false;
+  return connectFreshSocket();
 }
 
-export async function startBaileysSession(sessionId = SESSION_ID) {
-  return connectFreshSocket(sessionId);
-}
-
-export async function stopBaileysSession(sessionId = SESSION_ID) {
-  const state = getState(sessionId);
+export async function stopBaileysSession() {
   state.stopRequested = true;
   clearReconnectTimer(state);
   if (state.socket) {
@@ -781,19 +756,16 @@ export async function stopBaileysSession(sessionId = SESSION_ID) {
 }
 
 export async function stopAllBaileysSessions() {
-  for (const sessionId of sessions.keys()) {
-    await stopBaileysSession(sessionId);
-  }
+  await stopBaileysSession();
 }
 
-export async function getSessionStatus(sessionId = SESSION_ID) {
+export async function getSessionStatus() {
   await connectMongo();
-  await ensureSessionDocument(sessionId);
-  const state = getState(sessionId);
-  const sessionDoc = await WhatsAppSession.findOne(buildSessionFilter(sessionId)).lean().exec();
+  await ensureSessionDocument();
+  const sessionDoc = await WhatsAppSession.findOne(getSessionFilter()).lean().exec();
   return {
-    tenant_id: sessionId,
-    session_id: getSessionAlias(sessionId),
+    tenant_id: SESSION_TENANT_ID,
+    session_id: getSessionAlias(),
     name: typeof sessionDoc?.name === "string" && sessionDoc.name.trim() ? sessionDoc.name : null,
     status: state.status,
     qr: state.qr,
@@ -806,16 +778,16 @@ export async function getSessionStatus(sessionId = SESSION_ID) {
   };
 }
 
-export async function updateSessionMetadata(sessionId: string, metadata: { name?: string | null }) {
+export async function updateSessionMetadata(metadata: { name?: string | null }) {
   await connectMongo();
-  await ensureSessionDocument(sessionId);
+  await ensureSessionDocument();
   const name = typeof metadata.name === "string" && metadata.name.trim() ? metadata.name.trim() : null;
   await WhatsAppSession.updateOne(
-    buildSessionFilter(sessionId),
+    getSessionWriteFilter(),
     {
       $set: {
-        tenant_id: sessionId,
-        session_id: getSessionAlias(sessionId),
+        tenant_id: SESSION_TENANT_ID,
+        session_id: SESSION_ID,
         name,
       },
     },
@@ -823,15 +795,14 @@ export async function updateSessionMetadata(sessionId: string, metadata: { name?
   ).exec();
 }
 
-export async function sendWhatsAppMessage(numero: string, mensagem: string, sessionId = SESSION_ID) {
+export async function sendWhatsAppMessage(numero: string, mensagem: string) {
   await connectMongo();
-  await ensureSessionDocument(sessionId);
-  const state = getState(sessionId);
+  await ensureSessionDocument();
   const normalizedNumber = normalizePhoneNumber(numero);
   const messageText = mensagem.trim();
 
   if (!isValidPhoneNumber(numero)) {
-    throw new Error("Número de telefone inválido");
+    throw new Error("Numero de telefone invalido");
   }
 
   if (!messageText) {
@@ -842,17 +813,17 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string, sess
     throw new Error(`Mensagem excede o limite de ${MAX_MESSAGE_LENGTH} caracteres`);
   }
 
-  if (!trackRecentMessage(sessionId, normalizedNumber, messageText)) {
+  if (!trackRecentMessage(normalizedNumber, messageText)) {
     throw new Error("Mensagem duplicada bloqueada por anti-spam");
   }
 
-  return enqueueSend(state, async () => {
-    const sock = await waitForConnectedSocket(sessionId);
+  return enqueueSend(async () => {
+    const sock = await waitForConnectedSocket();
     await delay(SEND_DELAY_MS);
     const jid = jidFromPhone(normalizedNumber);
     const result = await sock.sendMessage(jid, { text: messageText });
 
-    const log = await writeMessageLog(sessionId, {
+    const log = await writeMessageLog({
       kind: "message",
       direction: "outbound",
       numero: normalizedNumber,
@@ -862,8 +833,8 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string, sess
     });
 
     emitRealtime("whatsapp:message-sent", {
-      session_id: sessionId,
-      tenant_id: sessionId,
+      session_id: SESSION_ID,
+      tenant_id: SESSION_TENANT_ID,
       numero: normalizedNumber,
       status: "sent",
       message_id: result?.key?.id ?? null,
@@ -873,16 +844,16 @@ export async function sendWhatsAppMessage(numero: string, mensagem: string, sess
   });
 }
 
-function enqueueSend<T>(state: RuntimeState, task: () => Promise<T>) {
+function enqueueSend<T>(task: () => Promise<T>) {
   const nextTask = state.writeChain.then(task, task);
   state.writeChain = nextTask.then(() => undefined, () => undefined);
   return nextTask;
 }
 
-export async function getCompanyLogs(sessionId = SESSION_ID) {
+export async function getCompanyLogs() {
   await connectMongo();
-  await ensureSessionDocument(sessionId);
-  return MessageLog.find(buildLogFilter(sessionId)).sort({ created_at: -1 }).limit(200).lean().exec();
+  await ensureSessionDocument();
+  return MessageLog.find(getSessionFilter()).sort({ created_at: -1 }).limit(200).lean().exec();
 }
 
 export async function ensureWhatsAppBoot() {
@@ -891,14 +862,7 @@ export async function ensureWhatsAppBoot() {
   }
 
   bootPromise = (async () => {
-    await startBaileysSession(DEFAULT_TENANT_ID);
-    const tenantIds = await getAutoStartTenantIds();
-    for (const tenantId of tenantIds) {
-      if (tenantId === DEFAULT_TENANT_ID) {
-        continue;
-      }
-      await startBaileysSession(tenantId);
-    }
+    await startBaileysSession();
   })();
 
   try {

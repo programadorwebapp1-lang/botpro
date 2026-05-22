@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, Box, Button, Card, CardContent, CircularProgress, Snackbar, Stack, TextField, Typography } from "@mui/material";
 import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import Image from "next/image";
-import { io, Socket } from "socket.io-client";
 
 type StatusPayload = {
   tenant_id?: string;
@@ -48,7 +47,7 @@ export function DashboardClient({ authToken }: DashboardClientProps) {
   const columns = useMemo<GridColDef[]>(
     () => [
       { field: "kind", headerName: "Tipo", width: 100 },
-      { field: "numero", headerName: "Número", flex: 1 },
+      { field: "numero", headerName: "Numero", flex: 1 },
       { field: "mensagem", headerName: "Mensagem", flex: 2 },
       { field: "status", headerName: "Status", width: 140 },
       { field: "detail", headerName: "Detalhe", flex: 2 },
@@ -80,44 +79,8 @@ export function DashboardClient({ authToken }: DashboardClientProps) {
   }, [authHeaders]);
 
   useEffect(() => {
-    const boot = window.setTimeout(() => {
-      refresh().catch(() => undefined);
-    }, 0);
-    const timer = setInterval(() => void refresh(), 5000);
-    return () => {
-      window.clearTimeout(boot);
-      clearInterval(timer);
-    };
+    refresh().catch(() => undefined);
   }, [refresh]);
-
-  useEffect(() => {
-    const socket: Socket = io({
-      path: "/socket.io",
-      auth: authToken ? { token: authToken } : undefined,
-    });
-
-    socket.on("whatsapp:qr", (payload: StatusPayload) => {
-      setStatus(payload);
-      if (payload.qr) setQrCode(payload.qr);
-    });
-    socket.on("whatsapp:status", (payload: StatusPayload) => {
-      setStatus((current) => ({ ...(current ?? payload), ...payload }));
-      if (payload.status === "connected") setQrCode(null);
-    });
-    socket.on("whatsapp:message-sent", (payload: { session_id: string; tenant_id?: string; numero: string; status: string; message_id: string | null }) => {
-      setSnack({ open: true, message: `Mensagem ${payload.status}`, severity: "success" });
-    });
-    socket.on("log:new", (payload: { log: LogRow }) => {
-      setLogs((current) => [payload.log, ...current]);
-    });
-    socket.on("connect_error", (error) => {
-      setSnack({ open: true, message: error.message || "Falha no Socket.IO", severity: "error" });
-    });
-
-    return () => {
-      socket.disconnect();
-    };
-  }, [authToken]);
 
   async function connect() {
     setLoading(true);
@@ -128,7 +91,7 @@ export function DashboardClient({ authToken }: DashboardClientProps) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Erro ao conectar");
-      setSnack({ open: true, message: "Conexão iniciada", severity: "success" });
+      setSnack({ open: true, message: "Conexao iniciada", severity: "success" });
       await refresh();
     } catch (error) {
       setSnack({ open: true, message: error instanceof Error ? error.message : "Erro", severity: "error" });
@@ -168,18 +131,18 @@ export function DashboardClient({ authToken }: DashboardClientProps) {
           <Stack direction={{ xs: "column", md: "row" }} spacing={3} sx={{ justifyContent: "space-between", alignItems: { md: "center" } }}>
             <Box>
               <Typography variant="h5" sx={{ fontWeight: 700 }}>Status do WhatsApp</Typography>
-              <Typography color="text.secondary">Integração interna com ERP via sessão persistente e Socket.IO seguro</Typography>
+              <Typography color="text.secondary">Integracao interna com ERP via sessao persistente</Typography>
               <Typography className="mt-2" color={status?.status === "connected" ? "success.main" : "error.main"} sx={{ fontWeight: 700 }}>
-                {status?.status === "connected" ? "🟢 Conectado" : "🔴 Desconectado"}
+                {status?.status === "connected" ? "Conectado" : "Desconectado"}
               </Typography>
               {status?.lastError && status.status !== "connected" && (
                 <Typography className="mt-2" color="warning.main" variant="body2">
-                  Último erro: {status.lastError}
+                  Ultimo erro: {status.lastError}
                 </Typography>
               )}
               {status?.nextRetryAt && status.status !== "connected" && (
                 <Typography className="mt-2" color="info.main" variant="body2">
-                  Próxima tentativa: {status.nextRetryAt}
+                  Proxima tentativa: {status.nextRetryAt}
                 </Typography>
               )}
             </Box>
@@ -201,7 +164,7 @@ export function DashboardClient({ authToken }: DashboardClientProps) {
         <CardContent className="space-y-4">
           <Typography variant="h6" sx={{ fontWeight: 700 }}>Enviar Mensagem</Typography>
           <Stack spacing={2}>
-            <TextField label="Número" value={numero} onChange={(e) => setNumero(e.target.value)} fullWidth />
+            <TextField label="Numero" value={numero} onChange={(e) => setNumero(e.target.value)} fullWidth />
             <TextField label="Mensagem" value={mensagem} onChange={(e) => setMensagem(e.target.value)} fullWidth multiline minRows={4} />
             <Button variant="contained" onClick={send} disabled={loading}>Enviar</Button>
           </Stack>

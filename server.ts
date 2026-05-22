@@ -1,10 +1,7 @@
 import "dotenv/config";
 import http from "http";
 import next from "next";
-import { Server } from "socket.io";
-import { ensureWhatsAppBoot, stopAllBaileysSessions } from "./src/lib/baileys";
-import { requireSocketToken } from "./src/lib/auth";
-import { setRealtimeServer } from "./src/lib/realtime";
+import { ensureWhatsAppBoot, stopBaileysSession } from "./src/lib/baileys";
 
 async function main() {
   const dev = process.env.NODE_ENV !== "production";
@@ -18,27 +15,13 @@ async function main() {
     void handle(req, res, { pathname: url.pathname, query: Object.fromEntries(url.searchParams) } as never);
   });
 
-  const io = new Server(server, {
-    cors: { origin: false },
-    path: "/socket.io",
-  });
-
-  io.use((socket, nextAuth) => {
-    const token = (socket.handshake.auth?.token as string | undefined) ?? socket.handshake.headers.authorization?.replace(/^Bearer\s+/i, "");
-    if (!requireSocketToken(token ?? "")) {
-      return nextAuth(new Error("unauthorized"));
-    }
-    return nextAuth();
-  });
-
-  setRealtimeServer(io);
   void ensureWhatsAppBoot().catch((error) => {
     console.error("[whatsapp] startup error", error);
   });
 
   const shutdown = async () => {
     try {
-      await stopAllBaileysSessions();
+      await stopBaileysSession();
     } catch {
       // ignore shutdown errors
     }

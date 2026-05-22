@@ -1,13 +1,9 @@
 type RealtimePayload = Record<string, unknown>;
 
-declare global {
-  var realtimeIo: import("socket.io").Server | undefined;
+export function setRealtimeServer() {
+  return undefined;
 }
 
-export function setRealtimeServer(io: import("socket.io").Server) {
-  global.realtimeIo = io;
-}
-
-export function emitRealtime(event: string, payload: RealtimePayload) {
-  global.realtimeIo?.emit(event, payload);
+export function emitRealtime(_event: string, _payload: RealtimePayload) {
+  return undefined;
 }
