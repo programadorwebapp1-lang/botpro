@@ -21,7 +21,7 @@ export function DashboardShell({ children }: PropsWithChildren) {
         <Box className="p-4 space-y-3">
           <div className="rounded-2xl bg-white/5 p-4">
             <p className="text-sm text-slate-300">Painel SaaS</p>
-            <p className="text-lg font-semibold">Operacao WhatsApp Meta</p>
+            <p className="text-lg font-semibold">Operação WhatsApp Meta</p>
           </div>
         </Box>
       </Drawer>
